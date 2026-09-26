@@ -305,14 +305,16 @@ codex plugin marketplace add GermanMik/pair-bridge
 codex plugin add pair-bridge@pair-bridge
 ```
 
-## Update from an earlier version
+## Update the plugin
+
+Ask Codex: “`/pair update the plugin on this computer`”. The skill checks the installed plugin and marketplace source, updates it with Codex's supported commands, and reports the installed version. For a Git marketplace, the commands are:
 
 ```sh
 codex plugin marketplace upgrade pair-bridge
 codex plugin add pair-bridge@pair-bridge
 ```
 
-Open a new task after updating so Codex discovers the `/pair` skill and current MCP tools. Version 0.7.0 adds a one-command Hermes setup and OpenAI-compatible PAIR gateway with device-qualified model IDs. Version 0.6.2 exposes installed device models when the PAIR router catalog is empty. Version 0.6.1 fixed free-memory sampling when Bridge runs locally on Windows. Version 0.6.0 added measured device capacity, local benchmark-based routing, and cancellable background requests with recovery metadata.
+This updates the computer running Codex; the bridge does not connect to configured LM Studio devices to update them. For a local source, update the source checkout through its normal workflow. Open a new task after updating so Codex discovers the `/pair` skill and current MCP tools. Version 0.7.0 adds a one-command Hermes setup and OpenAI-compatible PAIR gateway with device-qualified model IDs. Version 0.6.2 exposes installed device models when the PAIR router catalog is empty. Version 0.6.1 fixed free-memory sampling when Bridge runs locally on Windows. Version 0.6.0 added measured device capacity, local benchmark-based routing, and cancellable background requests with recovery metadata.
 
 ## For contributors
 
