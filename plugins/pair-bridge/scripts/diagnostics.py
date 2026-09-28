@@ -94,12 +94,20 @@ def stage(name: str, *, device: str | None = None, model: str | None = None) -> 
         pass
 
 
-def recent(limit: int = 20) -> list[dict]:
+def recent_with_status(limit: int = 20) -> tuple[list[dict], str]:
+    """Read the optional local journal without letting ACL errors break tools."""
     path = journal_path()
-    if not path.exists():
-        return []
+    try:
+        content = path.read_text(errors='replace')
+    except FileNotFoundError:
+        return [], 'not_created'
+    except PermissionError:
+        return [], 'permission_denied'
+    except OSError:
+        return [], 'unavailable'
+
     rows = []
-    for line in path.read_text(errors='replace').splitlines()[-max(limit * 10, limit):]:
+    for line in content.splitlines()[-max(limit * 10, limit):]:
         try:
             row = json.loads(line)
         except ValueError:
@@ -113,4 +121,8 @@ def recent(limit: int = 20) -> list[dict]:
     for row in result:
         if row.get('status') == 'running' and time.time() - row.get('started_at', 0) > 600:
             row['status'] = 'interrupted_or_stale'
-    return result
+    return result, 'ok'
+
+
+def recent(limit: int = 20) -> list[dict]:
+    return recent_with_status(limit)[0]

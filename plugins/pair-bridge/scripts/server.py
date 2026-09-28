@@ -821,15 +821,16 @@ def pair_diagnose() -> dict:
         router = {'online': True, 'advertised_models': advertised}
     except ValueError:
         router = {'online': False, 'error': 'PAIR router unavailable or catalog invalid'}
-    recent = diagnostics.recent()
+    recent, journal_status = diagnostics.recent_with_status()
     explanations = {'timeout': 'The device did not finish before the request deadline; inspect its load state before retrying.',
                     'device_unreachable': 'The device engine could not be reached; check its server and SSH/Tailscale path.',
                     'model_not_installed': 'The requested model is not installed on an online configured device.',
                     'empty_answer': 'The model returned no final text; a larger output budget may be needed.',
                     'load_failed': 'Loading did not complete or could not be confirmed; inspect memory and engine state.',
                     'request_failed': 'The request failed; check local engine logs without sharing prompts or tokens.'}
-    return {'devices': rows, 'router': router, 'recent_requests': [dict(row, explanation=explanations.get(row.get('reason')))
-                                                                  for row in recent]}
+    return {'devices': rows, 'router': router, 'request_journal_status': journal_status,
+            'recent_requests': [dict(row, explanation=explanations.get(row.get('reason')))
+                                for row in recent]}
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
