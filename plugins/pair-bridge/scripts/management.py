@@ -44,6 +44,12 @@ def devices():
         cap = row.get('max_loaded_bytes')
         if cap is not None and (not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0):
             raise ValueError('max_loaded_bytes must be a positive integer')
+        unload_models = row.get('auto_unload_models', [])
+        if (not isinstance(unload_models, list) or
+                any(not isinstance(model, str) or not model or model != model.strip() or len(model) > 512 or
+                    any(ch in model for ch in '\r\n\x00') for model in unload_models) or
+                len(set(unload_models)) != len(unload_models)):
+            raise ValueError('auto_unload_models must be a list of unique exact model keys')
         models_path = row.get('models_path')
         if models_path is not None and (not isinstance(models_path, str) or not models_path or len(models_path) > 512 or
                                         any(ch in models_path for ch in '\r\n\x00') or
@@ -232,3 +238,80 @@ def memory_preflight(device_id, rows, candidate, context_length, max_loaded_byte
             raise
         return {'status': 'unknown', 'reason': str(exc),
                 'note': 'No configured memory cap; loading may still fail or evict another instance.'}
+
+
+def is_capacity_error(error):
+    text = str(error)
+    return any(marker in text for marker in (
+        'Insufficient currently available',
+        'estimated memory limit would be exceeded',
+        'model-weight limit would be exceeded',
+        'Loaded instance context is unknown',
+    ))
+
+
+def describe_unloaded_instances(instances):
+    return ', '.join(f"{row['model']} [{row['instance_id']}]" for row in instances)
+
+
+def preflight_for_load(c, device_id, model_key, context_length, device_config,
+                       max_loaded_bytes=None, capacity=None, capacity_sampler=None):
+    """Preflight a cold load and, only for exact allowlisted keys, unload instances until it fits."""
+    rows = models(c)
+    candidate = next((row for row in rows if row['key'] == model_key), None)
+    if candidate is None:
+        raise ValueError('Model is not installed on this device; refresh the model inventory')
+    try:
+        memory = memory_preflight(device_id, rows, candidate, context_length, max_loaded_bytes, capacity)
+        return {'rows': rows, 'candidate': candidate, 'memory': memory, 'auto_unloaded_instances': []}
+    except ValueError as exc:
+        if not is_capacity_error(exc):
+            raise
+        last_error = exc
+
+    allowed = device_config.get('auto_unload_models', [])
+    if not allowed:
+        raise last_error
+
+    unloaded = []
+    for allowed_key in allowed:
+        if allowed_key == model_key:
+            continue
+        while True:
+            rows = models(c)
+            candidate = next((row for row in rows if row['key'] == model_key), None)
+            if candidate is None:
+                raise ValueError('Candidate model disappeared while making room; no load was started')
+            target = next((row for row in rows if row['key'] == allowed_key and row['loaded_instances']), None)
+            if target is None:
+                break
+            instance_id = target['loaded_instances'][0]['id']
+            try:
+                request(c, 'POST', '/api/v1/models/unload', {'instance_id': instance_id})
+            except ValueError as exc:
+                details = describe_unloaded_instances(unloaded)
+                if details:
+                    raise ValueError(f'{exc}; already released configured instances: {details}') from exc
+                raise
+            rows = models(c)
+            if any(instance['id'] == instance_id for row in rows for instance in row['loaded_instances']):
+                raise ValueError('Configured auto-unload did not remove the exact instance; stopped before loading')
+            unloaded.append({'model': allowed_key, 'instance_id': instance_id})
+            candidate = next((row for row in rows if row['key'] == model_key), None)
+            if candidate is None:
+                raise ValueError('Candidate model disappeared while making room; no load was started')
+            current_capacity = capacity_sampler() if capacity_sampler else None
+            try:
+                memory = memory_preflight(device_id, rows, candidate, context_length,
+                                          max_loaded_bytes, current_capacity)
+                return {'rows': rows, 'candidate': candidate, 'memory': memory,
+                        'auto_unloaded_instances': unloaded}
+            except ValueError as exc:
+                if not is_capacity_error(exc):
+                    raise
+                last_error = exc
+
+    if unloaded:
+        raise ValueError(f'{last_error}; configured auto_unload_models did not free enough memory '
+                         f'after releasing: {describe_unloaded_instances(unloaded)}')
+    raise last_error

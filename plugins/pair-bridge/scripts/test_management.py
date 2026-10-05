@@ -1,7 +1,10 @@
 import unittest
 from unittest.mock import patch
 import contextlib
+import json
 import subprocess
+import tempfile
+from pathlib import Path
 import server
 import management
 
@@ -14,6 +17,19 @@ class ManagementTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'not installed'):
                 management.find_model(object(), 'imaginary')
             req.assert_not_called()
+
+    def test_auto_unload_config_requires_unique_exact_model_keys(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / '.pair-bridge.json'
+            device = {'id': 'pc', 'engine': 'lmstudio', 'base_url': 'http://127.0.0.1:1234',
+                      'auto_unload_models': ['publisher/model-a']}
+            path.write_text(json.dumps({'devices': [device]}))
+            with patch.object(management.Path, 'home', return_value=Path(temp)):
+                self.assertEqual(management.devices()['pc']['auto_unload_models'], ['publisher/model-a'])
+                device['auto_unload_models'] = ['publisher/model-a', 'publisher/model-a']
+                path.write_text(json.dumps({'devices': [device]}))
+                with self.assertRaisesRegex(ValueError, 'unique exact model keys'):
+                    management.devices()
 
     def test_weight_limit_preserves_other_loaded_models(self):
         loaded = {'key': 'other', 'size_bytes': 80, 'loaded_instances': [{'id': 'other-i'}]}
@@ -43,6 +59,33 @@ class ManagementTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'context is unknown'):
                 management.memory_preflight('pc', [loaded, cold], cold, 8192, 100)
 
+    def test_preflight_unloads_only_allowlisted_exact_instances_and_rechecks(self):
+        other = {'key': 'permitted', 'loaded_instances': [{'id': 'permitted-i'}]}
+        cold = {'key': 'candidate', 'loaded_instances': []}
+        after = {'key': 'candidate', 'loaded_instances': []}
+        with patch.object(management, 'models', side_effect=[[other, cold], [other, cold], [after]]), \
+             patch.object(management, 'memory_preflight', side_effect=[
+                 ValueError('Insufficient currently available GPU memory'), {'status': 'estimated'}]) as preflight, \
+             patch.object(management, 'request', return_value={}) as request, \
+             patch.object(management, 'estimate_memory', return_value={}) as estimate:
+            result = management.preflight_for_load(
+                object(), 'pc', 'candidate', 8192, {'auto_unload_models': ['permitted']},
+                capacity={'checked_at': 1}, capacity_sampler=lambda: {'checked_at': 2})
+        self.assertEqual(result['auto_unloaded_instances'], [{'model': 'permitted', 'instance_id': 'permitted-i'}])
+        self.assertEqual(request.call_args.args[3], {'instance_id': 'permitted-i'})
+        self.assertEqual(preflight.call_count, 2)
+        self.assertEqual(estimate.call_count, 0)
+
+    def test_preflight_without_unload_setting_preserves_loaded_model(self):
+        other = {'key': 'other', 'loaded_instances': [{'id': 'other-i'}]}
+        cold = {'key': 'candidate', 'loaded_instances': []}
+        with patch.object(management, 'models', return_value=[other, cold]), \
+             patch.object(management, 'memory_preflight', side_effect=ValueError('Insufficient currently available GPU memory')), \
+             patch.object(management, 'request') as request:
+            with self.assertRaisesRegex(ValueError, 'Insufficient currently available'):
+                management.preflight_for_load(object(), 'pc', 'candidate', 8192, {})
+            request.assert_not_called()
+
     def test_estimator_accepts_cli_stderr_and_target_port(self):
         output = 'Estimated GPU Memory: 19.24 GiB\nEstimated Total Memory: 20.00 GiB\n'
         with patch.object(management, 'devices', return_value={'pc': {'base_url': 'http://127.0.0.1:1234'}}), \
@@ -71,24 +114,28 @@ class ManagementTests(unittest.TestCase):
                 server.pair_unload('pc','missing')
             req.assert_not_called()
 
-    @patch.object(management, 'memory_preflight', return_value={'status': 'estimated'})
-    def test_load_not_confirmed(self, _preflight):
+    @patch.object(management, 'preflight_for_load')
+    def test_load_not_confirmed(self, preflight):
         m={'key':'m','type':'llm','loaded_instances':[],'max_context_length':8192}
+        preflight.return_value={'memory': {'status':'estimated'}, 'candidate':m, 'auto_unloaded_instances':[]}
         with patch.object(server, 'inference_lock', self.scope), patch.object(management, 'client', return_value=self.scope()), patch.object(management, 'models', return_value=[m]), patch.object(management, 'devices', return_value={'pc': {}}), patch.object(management, 'find_model', return_value=m), patch.object(management, 'request', return_value={}):
             self.assertEqual(server.pair_load('pc','m')['status'],'not_confirmed')
 
-    @patch.object(management, 'memory_preflight', return_value={'status': 'estimated'})
-    def test_load_reports_engine_eviction_without_unloading_itself(self, _preflight):
+    @patch.object(management, 'preflight_for_load')
+    def test_load_reports_engine_eviction_without_unloading_itself(self, preflight):
         other = {'key': 'other', 'type': 'llm', 'size_bytes': 10, 'loaded_instances': [{'id': 'other-i'}]}
         cold = {'key': 'm', 'type': 'llm', 'size_bytes': 20, 'loaded_instances': [], 'max_context_length': 8192}
         warm = dict(cold, loaded_instances=[{'id': 'new-i'}])
+        preflight.return_value={'memory': {'status':'estimated'}, 'candidate':cold,
+                                'auto_unloaded_instances':[{'model':'other','instance_id':'other-i'}]}
         with patch.object(server, 'inference_lock', self.scope), patch.object(management, 'client', return_value=self.scope()), \
              patch.object(management, 'models', side_effect=[[other, cold], [warm]]), \
              patch.object(management, 'devices', return_value={'pc': {}}), \
              patch.object(management, 'find_model', return_value=warm), \
              patch.object(management, 'request', return_value={'instance_id': 'new-i', 'load_time_seconds': 1.5}) as req:
             result = server.pair_load('pc', 'm')
-        self.assertEqual(result['engine_evicted_instances'], ['other-i'])
+        self.assertEqual(result['engine_evicted_instances'], [])
+        self.assertEqual(result['auto_unloaded_instances'], [{'model':'other','instance_id':'other-i'}])
         self.assertEqual(result['load_time_seconds'], 1.5)
         self.assertEqual(req.call_args.args[2], '/api/v1/models/load')
 

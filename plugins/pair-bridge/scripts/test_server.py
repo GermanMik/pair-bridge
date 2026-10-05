@@ -156,6 +156,19 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'No suitable installed'):
             server.select_model(rows, model='missing', task_hint='code')
 
+    def test_smart_selector_skips_ranked_model_that_fails_memory_preflight(self):
+        inventory = [{'device': 'pc', 'online': True, 'capacity': {'checked_at': 9999999999}, 'models': [
+            {'key': 'qwen', 'type': 'llm', 'size_bytes': 10, 'loaded_instances': []},
+            {'key': 'ornith', 'type': 'llm', 'size_bytes': 20, 'loaded_instances': []}]}]
+        with patch.object(server.management, 'devices', return_value={'pc': {}}), \
+             patch.object(server.management, 'memory_preflight', side_effect=[
+                 ValueError('Insufficient currently available GPU memory'), {'status': 'estimated'}]):
+            device, model, memory, unloaded, rejected = server.select_model_for_memory(inventory, 8192, 'general')
+        self.assertEqual((device, model['key']), ('pc', 'ornith'))
+        self.assertEqual(memory['status'], 'estimated')
+        self.assertEqual(unloaded, [])
+        self.assertEqual(len(rejected), 1)
+
     def test_smart_ask_preserves_existing_instance(self):
         row = {'key': 'warm', 'type': 'llm', 'loaded_instances': [{'id': 'warm-i'}]}
         snapshot = {'devices': [{'device': 'mac', 'online': True, 'models': [row]}]}
@@ -173,6 +186,8 @@ class BridgeTests(unittest.TestCase):
         warm = {'key': 'cold', 'type': 'llm', 'loaded_instances': [{'id': 'owned-i'}]}
         snapshot = {'devices': [{'device': 'mac', 'online': True, 'models': [cold]}]}
         responses = [cold, warm, warm, {'key': 'cold', 'type': 'llm', 'loaded_instances': []}]
+        prepared = {'rows': [cold], 'candidate': cold, 'memory': {'status': 'estimated'},
+                    'auto_unloaded_instances': []}
         def send(_c, _method, route, _body):
             if route == '/api/v1/models/load':
                 return {'instance_id': 'owned-i'}
@@ -183,6 +198,7 @@ class BridgeTests(unittest.TestCase):
              patch.object(server.management, 'find_model', side_effect=responses), \
              patch.object(server.management, 'models', side_effect=[[cold], [warm]]), \
              patch.object(server.management, 'devices', return_value={'mac': {}}), \
+             patch.object(server.management, 'preflight_for_load', return_value=prepared), \
              patch.object(server.management, 'request', side_effect=send) as req:
             factory.return_value.__enter__.return_value = object()
             result = server.pair_smart_ask('question')
@@ -195,6 +211,8 @@ class BridgeTests(unittest.TestCase):
         cold = {'key': 'cold', 'type': 'llm', 'loaded_instances': []}
         warm = {'key': 'cold', 'type': 'llm', 'loaded_instances': [{'id': 'owned-i'}]}
         snapshot = {'devices': [{'device': 'mac', 'online': True, 'models': [cold]}]}
+        prepared = {'rows': [cold], 'candidate': cold, 'memory': {'status': 'estimated'},
+                    'auto_unloaded_instances': []}
         def send(_c, _method, route, _body):
             if route == '/api/v1/models/load':
                 return {'instance_id': 'owned-i'}
@@ -205,6 +223,7 @@ class BridgeTests(unittest.TestCase):
              patch.object(server.management, 'find_model', side_effect=[cold, warm]), \
              patch.object(server.management, 'models', side_effect=[[cold], [warm]]), \
              patch.object(server.management, 'devices', return_value={'mac': {}}), \
+             patch.object(server.management, 'preflight_for_load', return_value=prepared), \
              patch.object(server.management, 'request', side_effect=send) as req:
             factory.return_value.__enter__.return_value = object()
             with self.assertRaisesRegex(ValueError, 'timed out'):

@@ -40,6 +40,7 @@ class Job:
         self.instance_id = None
         self.owned = False
         self.cleanup = None
+        self.auto_unloaded_instances = []
         self.answer = ''
         self.error_code = None
         self.cancel_event = threading.Event()
@@ -57,7 +58,8 @@ class Job:
                     'created_at': self.created_at, 'updated_at': self.updated_at,
                     'status': self.status, 'stage': self.stage, 'progress': self.progress,
                     'instance_id': self.instance_id, 'loaded_for_job': self.owned,
-                    'cleanup': self.cleanup, 'error_code': self.error_code,
+                    'cleanup': self.cleanup, 'auto_unloaded_instances': self.auto_unloaded_instances,
+                    'error_code': self.error_code,
                     'answer': self.answer if self.status == 'completed' else None,
                     'partial_answer': self.answer[-4000:] if self.status in ('running', 'cancel_requested') else None}
 
