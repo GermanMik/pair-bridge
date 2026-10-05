@@ -50,7 +50,8 @@ class OperationsTests(unittest.TestCase):
         body = ''.join('event: ' + item['type'] + '\ndata: ' + json.dumps(item) + '\n\n' for item in events)
         client = httpx.AsyncClient(base_url='http://localhost:1234', transport=httpx.MockTransport(
             lambda request: httpx.Response(200, text=body)))
-        with tempfile.TemporaryDirectory() as temp, patch.object(jobs, 'journal_path', return_value=Path(temp) / 'jobs.jsonl'):
+        with tempfile.TemporaryDirectory() as temp, patch.object(jobs, 'journal_path', return_value=Path(temp) / 'jobs.jsonl'), \
+             patch.object(server.management, 'engine_for', return_value='lmstudio'):
             job = jobs.Job('pc', 'm')
             self.assertEqual(asyncio.run(server._job_stream(job, client, 'i', 'private prompt', 100)), 'Hello world')
             self.assertNotIn('PRIVATE REASONING', (Path(temp) / 'jobs.jsonl').read_text())

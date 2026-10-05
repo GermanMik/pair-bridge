@@ -4,7 +4,7 @@
 
 ### One bridge. Many tools. Your local models.
 
-**An open-source MCP bridge for compatible tools, NVIDIA PAIR, and LM Studio.**<br>
+**An open-source MCP bridge for compatible tools, NVIDIA PAIR, LM Studio, and Unsloth Studio.**<br>
 Discover models across devices · ask for a second opinion · compare answers · manage memory deliberately.
 
 [Get started](#get-started) · [See how MCP works](#what-does-mcp-actually-do) · [Explore the tools](#tool-reference) · [Русский](README.ru.md)
@@ -18,7 +18,7 @@ Discover models across devices · ask for a second opinion · compare answers ·
 
 </div>
 
-**PAIR Bridge lets compatible MCP clients use installed local models across configured devices. Codex and Oh My Pi are supported examples. Requests can route through PAIR or target configured LM Studio devices, including machines reachable over SSH/Tailscale.**
+**PAIR Bridge lets compatible MCP clients use installed local models across configured devices. Codex and Oh My Pi are supported examples. Requests can route through PAIR or target configured LM Studio and Unsloth Studio devices, including machines reachable over SSH/Tailscale.**
 
 | Discover | Ask & compare | Manage safely |
 | --- | --- | --- |
@@ -47,7 +47,7 @@ Think of the workflow as four jobs:
 
 **MCP is the tool connection; PAIR is the model router.** The bridge does not turn a local model into the main Codex model. Codex continues coordinating your task, and the consulted model returns text for Codex to assess.
 
-The diagram shows both supported paths: PAIR can route a request, or the bridge can target a configured LM Studio device directly.
+The diagram shows both supported paths: PAIR can route a request, or the bridge can target a configured local model engine directly.
 
 ## A real example
 
@@ -70,9 +70,9 @@ You need:
 - **Codex** with plugin marketplace support.
 - **[uv](https://docs.astral.sh/uv/getting-started/installation/)** installed and available on your PATH.
 - **PAIR running**, connected to at least one working chat model, for routed requests.
-- **LM Studio 0.4+** with its native API enabled on each device you want Codex to manage.
-- **The LM Studio `lms` CLI on the computer running Bridge** for memory estimates. Remote models are estimated through the existing SSH tunnel; Bridge does not run remote shell commands.
-- **OpenSSH** and a working SSH config alias for remote loopback-only LM Studio endpoints.
+- **LM Studio 0.4+ or Unsloth Studio** with its API enabled on each device you want Codex to manage.
+- **The LM Studio `lms` CLI** for LM Studio memory estimates. Unsloth uses its memory-estimate API when the selected model format is supported.
+- **OpenSSH** and a working SSH config alias for remote loopback-only engine endpoints.
 
 After installing uv, restart Codex so it can discover it. Confirm uv is available with `uv --version`.
 
@@ -129,7 +129,7 @@ To change it, create **`.pair-bridge.json` in your home directory**:
 | macOS / Linux | `~/.pair-bridge.json` |
 | Windows | `%USERPROFILE%\.pair-bridge.json` |
 
-Use your **PAIR router's endpoint**. An individual LM Studio endpoint only provides that server's models. `127.0.0.1` refers to the computer running the bridge.
+Use your **PAIR router's endpoint**. An individual model-engine endpoint only provides that server's models. `127.0.0.1` refers to the computer running the bridge.
 
 <details>
 <summary><strong>Environment variables and authentication</strong></summary>
@@ -142,7 +142,7 @@ If your endpoint requires a bearer token, set `PAIR_API_KEY` in that environment
 
 ## Configure managed devices
 
-Add native LM Studio API origins to the same configuration file. These are separate from the PAIR proxy URL:
+Add LM Studio or Unsloth Studio API origins to the same configuration file. These are separate from the PAIR proxy URL:
 
 ```json
 {
@@ -150,18 +150,20 @@ Add native LM Studio API origins to the same configuration file. These are separ
   "devices": [
     {"id": "mac", "engine": "lmstudio", "base_url": "http://127.0.0.1:1235"},
     {"id": "pc", "engine": "lmstudio", "base_url": "http://127.0.0.1:1235", "ssh_host": "my-pc",
-     "auto_unload_models": ["publisher/model-to-release"]}
+     "auto_unload_models": ["publisher/model-to-release"]},
+    {"id": "unsloth", "engine": "unsloth", "base_url": "http://127.0.0.1:8888",
+     "api_key_env": "UNSLOTH_API_KEY", "auto_unload_models": ["publisher/model-to-release"]}
   ]
 }
 ```
 
-Use the real native API origin from each LM Studio installation; the ports above are examples. `ssh_host` must be an existing OpenSSH config alias. The bridge opens a temporary loopback-only tunnel with host-key checking, runs no remote shell command, and closes the tunnel after the request. A direct HTTPS origin is also supported.
+Use each engine's API origin; ports above are examples. Unsloth Studio's default port is `8888`. Set `api_key_env` only when its API requires a bearer token. `ssh_host` must be an existing OpenSSH config alias. The bridge opens a temporary loopback-only tunnel with host-key checking, runs no remote shell command, and closes the tunnel after the request. A direct HTTPS origin is also supported.
 
-Each device may set `max_loaded_bytes` to a positive memory-estimate budget. Before a cold load Bridge uses the local `lms` CLI through the existing device tunnel to estimate the candidate at the requested context and every loaded instance at its actual context. It also checks fresh available RAM and NVIDIA VRAM when telemetry is available. It blocks a load if the candidate does not fit, or if the summed estimate plus 10% headroom exceeds the configured budget. Without a configured budget, an unavailable estimate is reported as unknown but does not block loading.
+Each device may set `max_loaded_bytes` to a positive memory-estimate budget. Before a cold LM Studio load Bridge uses `lms`; for Unsloth it calls `/api/inference/estimate-memory`. A complete estimate is required for the configured budget check. Unsloth currently returns an unavailable estimate for model formats it cannot size, including many Transformers models. Bridge reports that as unknown. With a configured budget, unknown estimates block loading; without one, Bridge still checks fresh local or SSH RAM/NVIDIA VRAM telemetry when it can compare a known estimate.
 
-By default, `auto_unload_models` is empty and Bridge does not free other loaded models. Add exact LM Studio model keys to that per-device list to allow Bridge to unload those models when a preflight reports insufficient memory. It unloads one exact instance at a time, verifies it disappeared, then rechecks the candidate estimate and current free memory. The target model is never unloaded to make room for itself. Every load result reports instances released by this setting. `pair_smart_ask` ranks installed models and chooses the first one that passes memory preflight; an explicitly requested model is never replaced. Its response includes rejected candidates and reasons. Calls wait up to 30 seconds in a per-device queue, and `/pair diagnose` shows queued/loading/inference stages while active. [LM Studio Idle TTL and Auto-Evict](https://lmstudio.ai/docs/developer/core/ttl-and-auto-evict) apply to JIT loads according to server settings; Bridge does not change those settings.
+By default, `auto_unload_models` is empty and Bridge does not free other loaded models. Add exact model keys to that per-device list to authorize unloading them when preflight proves a shortage. If an engine reports a clear out-of-memory error while the estimate is unknown, Bridge can also unload only listed models, verify each unload, and retry the load. The target model is never unloaded to make room for itself. Every load result reports instances released by this setting. `pair_smart_ask` ranks installed models and chooses the first one that passes memory preflight; an explicitly requested model is never replaced. Its response includes rejected candidates and reasons. Calls wait up to 30 seconds in a per-device queue, and `/pair diagnose` shows queued/loading/inference stages while active. [LM Studio Idle TTL and Auto-Evict](https://lmstudio.ai/docs/developer/core/ttl-and-auto-evict) apply to LM Studio JIT loads according to server settings; Bridge does not change those settings.
 
-Use `pair_memory_plan(device, model, context_length)` to inspect this estimate without loading. The planned context matters: on Alfred, Qwen3.8 27B was estimated at 19.24 GiB for 8,192 tokens and 26.03 GiB for 65,536 tokens. The native inventory reports the actual `loaded_instances[].config.context_length` of a running instance; `max_context_length` is only its supported limit. `size_bytes` describes model weights on disk, not total RAM/VRAM. `pair_devices` now also reports fresh available RAM, NVIDIA VRAM where present, and free disk space. [LM Studio CLI](https://lmstudio.ai/docs/cli/local-models/load), [model inventory](https://lmstudio.ai/docs/developer/rest/list).
+Use `pair_memory_plan(device, model, context_length)` to inspect estimates without loading. The planned context matters: on Alfred, Qwen3.8 27B was estimated at 19.24 GiB for 8,192 tokens and 26.03 GiB for 65,536 tokens. Unsloth reports a loaded model's actual context when its API provides it. `size_bytes` describes model weights on disk, not total RAM/VRAM. `pair_devices` reports fresh available RAM, NVIDIA VRAM where present, and free disk space. [LM Studio CLI](https://lmstudio.ai/docs/cli/local-models/load), [LM Studio inventory](https://lmstudio.ai/docs/developer/rest/list), [Unsloth Studio API source](https://github.com/unslothai/unsloth/tree/main/studio).
 
 ### Plan memory before loading
 
@@ -179,7 +181,7 @@ Downloading is separate from asking or loading. Ask Codex to call `pair_download
 
 The plan can verify the size of **one unambiguous GGUF file** and its repository revision; it rechecks both before starting. That file size may differ from the complete LM Studio download. Bridge checks free space with 10% headroom only when the target device is local. The destination is supplied for review: LM Studio does not confirm that it is its configured model folder. For remote devices, verify both the actual folder and free space on that device before starting. [LM Studio download API](https://lmstudio.ai/docs/developer/rest/download).
 
-Devices are configured explicitly. PAIR peer discovery does not grant model-management access. Ollama lifecycle management, model deletion, engine installation, and PAIR cluster administration are not implemented. The separate `pair_download` tool requires a one-use `pair_download_plan` and the exact model ID repeated in `confirm_model`; it is never used by `pair_ask` or `pair_smart_ask`.
+Devices are configured explicitly. PAIR peer discovery does not grant model-management access. Ollama lifecycle management, model deletion, engine installation, Unsloth model downloads, and PAIR cluster administration are not implemented. The separate `pair_download` tool is LM Studio-only, requires a one-use `pair_download_plan` and the exact model ID repeated in `confirm_model`; it is never used by `pair_ask` or `pair_smart_ask`.
 
 For an authenticated device, set `api_key_env` to the name of an environment variable containing its token and pass that variable to the MCP process through `.mcp.json` `env_vars`. Keep tokens out of configuration committed to Git and out of prompts.
 
@@ -222,9 +224,9 @@ model:
   api_mode: chat_completions
 ```
 
-Replace `pc` and the model key with IDs from your device configuration and `GET http://127.0.0.1:8765/v1/models`. Choose models with `hermes model` or `/model`. Device-qualified models go directly to that LM Studio device; unqualified IDs go through the PAIR router.
+Replace `pc` and the model key with IDs from your device configuration and `GET http://127.0.0.1:8765/v1/models`. Choose models with `hermes model` or `/model`. Device-qualified models go directly to that configured engine; unqualified IDs go through the PAIR router.
 
-Device models must be installed in LM Studio, with its API reachable from the gateway host. LM Studio may load a model on demand and consume memory; use the MCP Bridge tools for explicit loading and memory checks. The gateway accepts text chat-completion requests and emits OpenAI-compatible SSE when Hermes requests streaming. It binds to loopback by default. For network access, set `HERMES_PAIR_HOST` and `HERMES_PAIR_API_KEY` and expose the port only on a trusted network. Set `PAIR_BASE_URL` and `PAIR_API_KEY` for the router, as with the MCP server.
+Device models must be installed in their configured engine, with its API reachable from the gateway host. Unsloth device requests require the model to be loaded through PAIR Bridge first, so memory preflight runs before inference. The gateway accepts text chat-completion requests and emits OpenAI-compatible SSE when Hermes requests streaming. It binds to loopback by default. For network access, set `HERMES_PAIR_HOST` and `HERMES_PAIR_API_KEY` and expose the port only on a trusted network. Set `PAIR_BASE_URL` and `PAIR_API_KEY` for the router, as with the MCP server.
 
 ## Troubleshooting
 
@@ -232,11 +234,11 @@ Device models must be installed in LM Studio, with its API reachable from the ga
 | --- | --- |
 | Tools do not appear | Open a new task; verify the plugin is enabled and `uv` is on Codex's PATH. |
 | Cannot reach PAIR | Start PAIR and check its endpoint against the configuration file. |
-| A configured device is unreachable | Verify its LM Studio native API, port, and direct HTTPS or SSH connection. |
+| A configured device is unreachable | Verify its configured engine API, port, and direct HTTPS or SSH connection. |
 | A model is listed but fails | Inspect PAIR's job details and model-server logs. Catalog entries are not health checks. |
 | A named model is not installed | Run `/pair` inventory and choose an exact installed key; the bridge does not download missing weights. |
-| Memory preflight is unknown or blocks a load | Check that `lms` works on the Bridge computer, use the intended context, and review the device's `max_loaded_bytes` budget. The budget is not a free-memory reading. |
-| Download plan cannot verify size or destination | Use an exact Hugging Face GGUF repository and quantization when available; otherwise provide a reviewed size estimate. Check LM Studio's actual storage folder and remote free space yourself. |
+| Memory preflight is unknown or blocks a load | For LM Studio, check `lms`; for Unsloth, check whether Studio can estimate the model format. Use the intended context and review `max_loaded_bytes`. |
+| Download plan cannot verify size or destination | Downloads are LM Studio-only. Use an exact Hugging Face GGUF repository and quantization when available; otherwise provide a reviewed size estimate. Check the actual storage folder and remote free space yourself. |
 | HTTP 400 or 500 | Check the exact model ID, model loading, memory availability, and server errors. |
 | Another request is running | Wait for the current bridge call to finish. |
 | Timeout | Check PAIR before retrying: the model job may still be running. |
@@ -246,7 +248,7 @@ Device models must be installed in LM Studio, with its API reachable from the ga
 
 `/pair` activates the skill that teaches Codex how to plan safe model operations. The names below are MCP tools used by that skill. They are not terminal commands.
 
-Without `device`, `pair_list` and `pair_ask` use the PAIR router. With `device`, they target that configured LM Studio instance directly. Direct inference requires exactly one loaded instance of the selected model key.
+Without `device`, `pair_list` and `pair_ask` use the PAIR router. With `device`, they target that configured engine directly. Direct inference requires exactly one loaded instance of the selected model key.
 
 **`pair_ask`** — requires `model` (an exact ID from `pair_list`) and `prompt` (your question). Optional `max_tokens` defaults to `2048`.
 
@@ -278,7 +280,7 @@ Example arguments for `pair_ask` (replace the model ID):
 | `pair_download_plan` / `pair_download` / `pair_download_status` | Exact model and destination; optional estimate for unknown sizes; one-use plan ID, repeated `confirm_model`; job ID | A Hugging Face repository link with an unambiguous GGUF file can provide independently checked file size/revision. Free space is checked with 10% headroom when the configured `models_path` matches the destination. Otherwise the actual storage path remains unverified. Catalog IDs require a caller-supplied estimate. LM Studio reports the job total only after starting. |
 | `pair_decide` / `pair_score` | State, Choice options or ordered Score levels, `allow_external=true` | Optional typed evaluation from **external** TypeSafe AI Jev; requires `TYPESAFE_API_KEY`. |
 
-The smart path requires at least one explicitly configured, online LM Studio device. It preserves pre-existing loaded instances. An instance loaded for a successful smart request is unloaded by default; an inference error or timeout leaves it loaded for inspection. Other applications can use the same LM Studio server, so Bridge cannot guarantee an instance is idle outside its own calls. Set `unload_after=false` when sharing a model with other clients.
+The smart path requires at least one explicitly configured, online device. It preserves pre-existing loaded instances. An instance loaded for a successful smart request is unloaded by default; an inference error or timeout leaves it loaded for inspection. Other applications can use the same engine, so Bridge cannot guarantee an instance is idle outside its own calls. Set `unload_after=false` when sharing a model with other clients.
 
 Oh My Pi users can use the same MCP server and a native `/pair` command. See the [OMP setup guide](docs/OMP.md). Jev is a separate cloud decision service, never a local chat fallback; the bridge sends no state to it without an explicit `allow_external=true` call. [TypeSafe API reference](https://docs.typesafe.ai/api).
 
@@ -292,7 +294,7 @@ Oh My Pi users can use the same MCP server and a native `/pair` command. See the
 - Default output budget: 2,048 tokens; allowed range: 32–8,192. Input: up to 48,000 characters. Model context limits still apply.
 - Request timeout: 180 seconds. Cancellation or timeout does not guarantee cancellation of the upstream model job.
 - Empty final answers are errors. Answers stopped by the output budget are marked as truncated.
-- Unloading affects the exact LM Studio instance and can disrupt another application that uses it. The skill tracks task-owned loads and avoids unloading unrelated instances.
+- Unloading affects the exact configured model instance and can disrupt another application that uses it. The skill tracks task-owned loads and avoids unloading unrelated instances.
 - The bridge does not change persistent engine settings or repair model catalogs. Explicit loads can set context length.
 
 </details>

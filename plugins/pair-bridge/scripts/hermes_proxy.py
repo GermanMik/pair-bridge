@@ -2,7 +2,7 @@
 # requires-python = ">=3.11,<3.15"
 # dependencies = ["httpx==0.28.1"]
 # ///
-"""OpenAI-compatible gateway exposing PAIR and configured LM Studio models to Hermes."""
+"""OpenAI-compatible gateway exposing PAIR and configured local models to Hermes."""
 from __future__ import annotations
 
 import json
@@ -72,9 +72,11 @@ def models() -> list[dict]:
     for device in management.devices():
         try:
             with management.client(device) as client:
-                for item in management.models(client):
+                engine = management.engine_for(device)
+                for item in management.models(client, device):
                     if (item.get('type') == 'llm' and isinstance(item.get('key'), str)
-                            and chat_candidate(item['key'])):
+                            and chat_candidate(item['key'])
+                            and (engine != 'unsloth' or item['loaded_instances'])):
                         result.append({'id': PREFIX + device + '/' + item['key'],
                                        'object': 'model', 'owned_by': 'PAIR device ' + device})
         except (ValueError, httpx.HTTPError):
@@ -178,8 +180,15 @@ class Handler(BaseHTTPRequestHandler):
                 if not sep or device not in management.devices() or not model_id:
                     raise ValueError('Use an exact model ID returned by /v1/models')
                 with management.client(device) as client:
-                    # Use model key: LM Studio can reuse or JIT-load an installed model.
-                    body['model'] = model_id
+                    if management.engine_for(device) == 'unsloth':
+                        selected = management.find_model(client, model_id, device)
+                        if len(selected['loaded_instances']) != 1:
+                            raise ValueError('Load this Unsloth model through PAIR Bridge first so memory preflight can run')
+                        body['model'] = management.chat_model_id(
+                            device, model_id, selected['loaded_instances'][0]['id'])
+                    else:
+                        # LM Studio may reuse or JIT-load an installed model.
+                        body['model'] = model_id
                     upstream = management.request(client, 'POST', '/v1/chat/completions', body)
                 return self.send_completion(upstream, model, wants_stream)
             # The request body and model ID pass through to PAIR router unchanged.

@@ -117,7 +117,7 @@ def checked_models(device: str, rows: list[dict]) -> list[dict]:
 def resource_summary(rows: list[dict], cap: int | None) -> dict:
     return {'max_loaded_bytes': cap,
             'loaded_model_weight_bytes': sum(m.get('size_bytes', 0) for m in rows if m['loaded_instances']),
-            'note': 'These are disk weight sizes, not memory estimates. Cold-load preflight uses the LM Studio CLI and configured context; free RAM/VRAM is not exposed by the API.'}
+            'note': 'Disk weight sizes are not memory estimates. Cold-load preflight uses the configured engine estimate and fresh RAM/VRAM telemetry when available.'}
 
 
 def completion(data: dict, requested_model: str, device: str | None, started: float) -> dict:
@@ -268,7 +268,7 @@ def pair_benchmark(device: str, model: str,
         raise ValueError('Provide 3–12 cases with prompt and expected_contains within size limits')
     diagnostics.stage('queue', device=device, model=model)
     with inference_lock(device, wait_seconds=30), management.client(device) as c:
-        selected = management.find_model(c, model)
+        selected = management.find_model(c, model, device)
         if selected.get('type') != 'llm' or len(selected['loaded_instances']) != 1:
             raise ValueError('Benchmark requires one already loaded chat instance; no model was loaded')
         instance = selected['loaded_instances'][0]
@@ -282,7 +282,8 @@ def pair_benchmark(device: str, model: str,
             started = time.monotonic()
             try:
                 data = management.request(c, 'POST', '/v1/chat/completions',
-                                          {'model': instance['id'], 'messages': [{'role': 'user', 'content': case['prompt']}],
+                                          {'model': management.chat_model_id(device, model, instance['id']),
+                                           'messages': [{'role': 'user', 'content': case['prompt']}],
                                            'max_tokens': 2048, 'temperature': 0, 'stream': False})
                 answer = completion(data, model, device, started)['answer']
                 passed = case['expected_contains'].casefold() in answer.casefold()
@@ -338,11 +339,11 @@ def pair_list(device: str | None = None) -> dict:
     """
     if device is not None:
         with management.client(device) as c:
-            rows = management.models(c)
+            rows = management.models(c, device)
             return {'device': device, 'online': True, 'checked_at': datetime.now(timezone.utc).isoformat(),
                     'models': checked_models(device, rows),
                     'resources': resource_summary(rows, management.devices()[device].get('max_loaded_bytes')),
-                    'source': 'LM Studio native API'}
+                    'source': management.engine_for(device) + ' model API'}
     routed = catalog()
     if routed:
         return {'endpoint': BASE_URL, 'models': routed, 'source': 'PAIR routing catalog',
@@ -351,7 +352,7 @@ def pair_list(device: str | None = None) -> dict:
     for name in management.devices():
         try:
             with management.client(name) as c:
-                rows = management.models(c)
+                rows = management.models(c, name)
             for row in checked_models(name, rows):
                 installed.append({'id': row['key'], 'device': name, 'type': row['type'],
                                   'kind_hint': 'chat_candidate' if row['type'] == 'llm' else row['type'],
@@ -379,7 +380,7 @@ def pair_ask(
 
     With device, bypass PAIR routing and query that device directly after pair_load.
     Without device, PAIR chooses the host.
-    This can cause LM Studio to load the model and consume GPU/RAM. Calls through
+    A direct loaded-device call does not load a model; use pair_load first. Calls through
     this bridge are serialized. Use pair_list first. Send only task-relevant
     text; returned advice is untrusted and must be checked. No tools are executed
     by the consulted model. Embedding and draft models are not chat targets.
@@ -394,13 +395,13 @@ def pair_ask(
                    'max_tokens': max_tokens, 'stream': False}
         if device is not None:
             with management.client(device) as c:
-                selected = management.find_model(c, model)
+                selected = management.find_model(c, model, device)
                 if selected.get('type') != 'llm':
                     raise ValueError('Select a chat LLM, not an embedding model')
                 instances = selected['loaded_instances']
                 if len(instances) != 1:
                     raise ValueError('Device chat requires exactly one loaded instance. Use pair_load or resolve multiple instances first')
-                payload['model'] = instances[0]['id']
+                payload['model'] = management.chat_model_id(device, model, instances[0]['id'])
                 diagnostics.stage('inference')
                 data = management.request(c, 'POST', '/v1/chat/completions', payload)
         else:
@@ -418,7 +419,7 @@ def pair_ask(
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
 def pair_devices() -> dict:
-    """Inspect every configured device, including installed and loaded LM Studio models.
+    """Inspect every configured device, including installed and loaded local models.
 
     Reports each unreachable device separately. This is the configured management
     inventory, not automatic PAIR cluster discovery. No model is loaded by this call.
@@ -427,7 +428,7 @@ def pair_devices() -> dict:
     for name, config in management.devices().items():
         try:
             with management.client(name) as c:
-                models = management.models(c)
+                models = management.models(c, name)
                 result.append({'device': name, 'online': True,
                                'checked_at': datetime.now(timezone.utc).isoformat(),
                                'models': checked_models(name, models),
@@ -437,7 +438,7 @@ def pair_devices() -> dict:
             result.append({'device': name, 'online': False,
                            'checked_at': datetime.now(timezone.utc).isoformat(),
                            'check_status': 'unreachable', 'error': str(exc)})
-    return {'devices': result, 'notice': 'Management covers configured LM Studio devices only. PAIR routing catalog remains pair_list().'}
+    return {'devices': result, 'notice': 'Management covers explicitly configured LM Studio and Unsloth devices only. PAIR routing catalog remains pair_list().'}
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
@@ -452,7 +453,7 @@ def pair_load(device: str, model: str,
     diagnostics.stage('queue', device=device, model=model)
     with inference_lock(device, wait_seconds=30), management.client(device) as c:
         diagnostics.stage('inventory')
-        before_rows = management.models(c)
+        before_rows = management.models(c, device)
         matches = [m for m in before_rows if m['key'] == model]
         if len(matches) != 1:
             raise ValueError('Model is not installed on this device. Refresh pair_list(device=...)')
@@ -473,35 +474,35 @@ def pair_load(device: str, model: str,
         if selected['loaded_instances']:
             return {'device': device, 'status': 'already_loaded', 'model': selected,
                     'auto_unloaded_instances': prepared['auto_unloaded_instances']}
-        body = {'model': model}
-        if selected.get('type') == 'llm':
-            body['context_length'] = context_length
         diagnostics.stage('load')
         try:
-            load_result = management.request(c, 'POST', '/api/v1/models/load', body)
+            load_attempt = management.load_with_auto_unload(
+                c, device, model, context_length, selected.get('type'), device_config)
+            load_result = load_attempt['result']
         except ValueError as exc:
             details = management.describe_unloaded_instances(prepared['auto_unloaded_instances'])
             if details:
                 raise ValueError(f'{exc}; configured auto_unload_models released: {details}') from exc
             raise
+        auto_unloaded = [*prepared['auto_unloaded_instances'], *load_attempt['auto_unloaded_instances']]
         diagnostics.stage('verification')
-        after = management.find_model(c, model)
-        after_rows = management.models(c)
+        after = management.find_model(c, model, device)
+        after_rows = management.models(c, device)
         before_ids = {i['id'] for m in before_rows for i in m['loaded_instances']}
         after_ids = {i['id'] for m in after_rows for i in m['loaded_instances']}
         return {'device': device, 'status': 'loaded' if after['loaded_instances'] else 'not_confirmed',
                 'model': after, 'load_time_seconds': load_result.get('load_time_seconds'),
                 'engine_evicted_instances': sorted(before_ids - after_ids -
-                                                   {row['instance_id'] for row in prepared['auto_unloaded_instances']}),
-                'auto_unloaded_instances': prepared['auto_unloaded_instances'], 'memory_preflight': memory}
+                                                   {row['instance_id'] for row in auto_unloaded}),
+                'auto_unloaded_instances': auto_unloaded, 'memory_preflight': memory}
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
 def pair_memory_plan(device: str, model: str,
                      context_length: Annotated[int, Field(ge=512, le=262144)] = 8192) -> dict:
-    """Estimate memory on the target LM Studio device without loading the installed model."""
+    """Estimate memory on the configured engine without loading the installed model."""
     with inference_lock(device, wait_seconds=30), management.client(device) as c:
-        rows = management.models(c)
+        rows = management.models(c, device)
         selected = next((m for m in rows if m['key'] == model), None)
         if selected is None:
             raise ValueError('Model is not installed on this device; no download was made')
@@ -526,13 +527,15 @@ def pair_unload(device: str, instance_id: str) -> dict:
     diagnostics.stage('queue', device=device)
     with inference_lock(device, wait_seconds=30), management.client(device) as c:
         diagnostics.stage('inventory')
-        before = management.models(c)
-        if not any(i['id'] == instance_id for m in before for i in m['loaded_instances']):
+        before = management.models(c, device)
+        owner = next((m['key'] for m in before for i in m['loaded_instances']
+                      if i['id'] == instance_id), None)
+        if owner is None:
             raise ValueError('Instance is not loaded. Refresh pair_list(device=...)')
         diagnostics.stage('unload')
-        management.request(c, 'POST', '/api/v1/models/unload', {'instance_id': instance_id})
+        management.unload_model(c, device, owner, instance_id)
         diagnostics.stage('verification')
-        remaining = management.models(c)
+        remaining = management.models(c, device)
         still_loaded = any(i['id'] == instance_id for m in remaining for i in m['loaded_instances'])
         return {'device': device, 'instance_id': instance_id, 'status': 'not_confirmed' if still_loaded else 'unloaded'}
 
@@ -583,7 +586,7 @@ def pair_smart_ask(
         engine_evicted_instances = []
         with management.client(selected_device) as c:
             # Recheck after selection: another application may have changed the load state.
-            live = management.find_model(c, key)
+            live = management.find_model(c, key, selected_device)
             if live.get('type') != 'llm':
                 raise ValueError('Selected model is no longer a chat LLM; refresh inventory')
             limit = live.get('max_context_length')
@@ -599,7 +602,7 @@ def pair_smart_ask(
                     raise ValueError('Loaded instance context is smaller than requested; choose a smaller context or another model')
             if not instances:
                 diagnostics.stage('preflight')
-                before_rows = management.models(c)
+                before_rows = management.models(c, selected_device)
                 candidate = next((m for m in before_rows if m['key'] == key), None)
                 if candidate is None:
                     raise ValueError('Selected model disappeared before load; refresh inventory')
@@ -620,26 +623,31 @@ def pair_smart_ask(
                     instances = candidate['loaded_instances']
                 else:
                     try:
-                        load_result = management.request(c, 'POST', '/api/v1/models/load',
-                                                         {'model': key, 'context_length': context_length})
+                        load_attempt = management.load_with_auto_unload(
+                            c, selected_device, key, context_length, candidate.get('type'), device_config)
+                        load_result = load_attempt['result']
                     except ValueError as exc:
                         details = management.describe_unloaded_instances(preselected_unloaded)
                         if details:
                             raise ValueError(f'{exc}; configured auto_unload_models released: {details}') from exc
                         raise
+                    preselected_unloaded = [*preselected_unloaded, *load_attempt['auto_unloaded_instances']]
                     load_time_seconds = load_result.get('load_time_seconds')
-                    loaded_id = load_result.get('instance_id')
-                    if not isinstance(loaded_id, str) or not loaded_id:
-                        raise ValueError('Load response had no instance ID; inspect state before retrying')
-                    after = management.find_model(c, key)
-                    if len(after['loaded_instances']) != 1 or after['loaded_instances'][0]['id'] != loaded_id:
+                    after = management.find_model(c, key, selected_device)
+                    if len(after['loaded_instances']) != 1:
                         raise ValueError('Load state is not confirmed; inspect pair_list before retrying')
+                    loaded_id = after['loaded_instances'][0]['id']
+                    if management.engine_for(selected_device) != 'unsloth':
+                        response_id = load_result.get('instance_id')
+                        if not isinstance(response_id, str) or response_id != loaded_id:
+                            raise ValueError('Load state is not confirmed; inspect pair_list before retrying')
                     owned_id = loaded_id
                     instances = after['loaded_instances']
-                    after_ids = {i['id'] for m in management.models(c) for i in m['loaded_instances']}
+                    after_ids = {i['id'] for m in management.models(c, selected_device) for i in m['loaded_instances']}
                     intentional = {row['instance_id'] for row in preselected_unloaded}
                     engine_evicted_instances = sorted(before_ids - after_ids - intentional)
-            payload = {'model': instances[0]['id'], 'messages': [{'role': 'user', 'content': prompt}],
+            payload = {'model': management.chat_model_id(selected_device, key, instances[0]['id']),
+                       'messages': [{'role': 'user', 'content': prompt}],
                        'max_tokens': max_tokens, 'stream': False}
             try:
                 diagnostics.stage('inference')
@@ -656,11 +664,11 @@ def pair_smart_ask(
                 if owned_id and unload_after:
                     diagnostics.stage('cleanup')
                     # This lock excludes other bridge calls, but cannot observe external clients.
-                    current = management.find_model(c, key)['loaded_instances']
+                    current = management.find_model(c, key, selected_device)['loaded_instances']
                     if len(current) == 1 and current[0]['id'] == owned_id:
                         try:
-                            management.request(c, 'POST', '/api/v1/models/unload', {'instance_id': owned_id})
-                            confirmed = management.find_model(c, key)['loaded_instances']
+                            management.unload_model(c, selected_device, key, owned_id)
+                            confirmed = management.find_model(c, key, selected_device)['loaded_instances']
                             cleanup = 'unloaded' if not confirmed else 'not_confirmed'
                         except ValueError:
                             cleanup = 'failed_inspect_instance'
@@ -690,7 +698,60 @@ def pair_smart_ask(
 
 
 async def _job_stream(job: jobs.Job, c: httpx.AsyncClient, instance_id: str, prompt: str, max_tokens: int) -> str:
-    """Consume LM Studio native SSE; retain message text only, never reasoning/tool content."""
+    """Consume engine SSE; retain message text only, never reasoning/tool content."""
+    if management.engine_for(job.device) == 'unsloth':
+        payload = {'model': management.chat_model_id(job.device, job.model, instance_id),
+                   'messages': [{'role': 'user', 'content': prompt}],
+                   'max_tokens': max_tokens, 'stream': True}
+        ended = False
+        async with c.stream('POST', '/v1/chat/completions', json=payload) as response:
+            if not response.is_success:
+                raise ValueError(f'Device returned HTTP {response.status_code}; no retry was made')
+            async for line in response.aiter_lines():
+                if job.cancel_event.is_set():
+                    raise asyncio.CancelledError()
+                if not line.startswith('data:'):
+                    continue
+                event = line[5:].strip()
+                if not event:
+                    continue
+                if event == '[DONE]':
+                    ended = True
+                    break
+                if len(event) > 1_000_000:
+                    raise ValueError('Device SSE event exceeded size limit')
+                try:
+                    data = json.loads(event)
+                except ValueError as exc:
+                    raise ValueError('Device returned invalid SSE JSON') from exc
+                if not isinstance(data, dict):
+                    raise ValueError('Device returned invalid SSE event')
+                if 'error' in data:
+                    raise ValueError('Device reported a streaming error')
+                choices = data.get('choices')
+                if not isinstance(choices, list) or not choices:
+                    continue
+                first = choices[0]
+                delta = first.get('delta') if isinstance(first, dict) else None
+                content = delta.get('content') if isinstance(delta, dict) else None
+                if isinstance(content, str):
+                    job.add_text(content)
+                    job.update(stage='generating', progress=None)
+                elif isinstance(content, list):
+                    text = ''.join(part.get('text', '') for part in content
+                                   if isinstance(part, dict) and part.get('type') == 'text'
+                                   and isinstance(part.get('text'), str))
+                    if text:
+                        job.add_text(text)
+                        job.update(stage='generating', progress=None)
+        if job.cancel_event.is_set():
+            raise asyncio.CancelledError()
+        if not ended:
+            raise ValueError('Device stream ended before [DONE]')
+        if not job.answer.strip():
+            raise ValueError('Model returned no final text')
+        return job.answer
+
     payload = {'model': instance_id, 'input': prompt, 'max_output_tokens': max_tokens,
                'stream': True, 'store': False, 'integrations': []}
     ended = False
@@ -757,7 +818,7 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
                 job.update(status='cancelled', stage='cancelled')
                 return
             job.update(status='running', stage='inventory')
-            rows = management.models(c)
+            rows = management.models(c, job.device)
             selected = next((m for m in rows if m['key'] == job.model), None)
             if selected is None or selected.get('type') != 'llm':
                 raise ValueError('Model is not an installed chat LLM on this device')
@@ -794,20 +855,20 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
                         job.update(status='cancelled', stage='cancelled')
                         return
                     job.update(stage='loading')
-                    loaded = management.request(c, 'POST', '/api/v1/models/load',
-                                                {'model': job.model, 'context_length': context_length})
-                    instance_id = loaded.get('instance_id')
-                    if not isinstance(instance_id, str) or not instance_id:
-                        raise ValueError('Load response had no instance ID')
+                    load_attempt = management.load_with_auto_unload(
+                        c, job.device, job.model, context_length, selected.get('type'), config)
+                    job.update(auto_unloaded_instances=[*prepared['auto_unloaded_instances'],
+                                                       *load_attempt['auto_unloaded_instances']])
+                    confirmed = management.find_model(c, job.model, job.device)['loaded_instances']
+                    if len(confirmed) != 1:
+                        raise ValueError('Loaded instance could not be confirmed')
+                    instance_id = confirmed[0]['id']
                     owned_id = instance_id
                     job.update(instance_id=instance_id, owned=True)
-                    confirmed = management.find_model(c, job.model)['loaded_instances']
-                    if not any(row['id'] == instance_id for row in confirmed):
-                        raise ValueError('Loaded instance could not be confirmed')
             job.update(instance_id=instance_id)
             if job.cancel_event.is_set():
                 if owned_id:
-                    management.request(c, 'POST', '/api/v1/models/unload', {'instance_id': owned_id})
+                    management.unload_model(c, job.device, job.model, owned_id)
                     job.update(cleanup='unloaded_before_inference')
                 job.update(status='cancelled', stage='cancelled')
                 return
@@ -835,10 +896,10 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
             if owned_id:
                 cleanup = 'new_instance_retained'
                 if unload_after:
-                    current = management.find_model(c, job.model)['loaded_instances']
+                    current = management.find_model(c, job.model, job.device)['loaded_instances']
                     if len(current) == 1 and current[0]['id'] == owned_id:
-                        management.request(c, 'POST', '/api/v1/models/unload', {'instance_id': owned_id})
-                        cleanup = 'unloaded' if not management.find_model(c, job.model)['loaded_instances'] else 'not_confirmed'
+                        management.unload_model(c, job.device, job.model, owned_id)
+                        cleanup = 'unloaded' if not management.find_model(c, job.model, job.device)['loaded_instances'] else 'not_confirmed'
                     else:
                         cleanup = 'state_changed_preserved'
             job.update(status='completed', stage='completed', progress=1, cleanup=cleanup)
@@ -889,7 +950,7 @@ def pair_job_recover(job_id: str) -> dict:
         return dict(state, recovery='no_owned_instance_recorded')
     try:
         with management.client(state['device']) as c:
-            rows = management.models(c)
+            rows = management.models(c, state['device'])
         present = any(i['id'] == instance_id for row in rows for i in row['loaded_instances'])
         return dict(state, recovery='instance_present' if present else 'instance_absent')
     except ValueError:
@@ -940,7 +1001,7 @@ def pair_diagnose() -> dict:
     for name in management.devices():
         try:
             with management.client(name) as c:
-                models = management.models(c)
+                models = management.models(c, name)
             rows.append({'device': name, 'online': True, 'installed': len(models),
                          'chat_models': sum(m.get('type') == 'llm' for m in models),
                          'loaded_instances': sum(len(m['loaded_instances']) for m in models)})
@@ -989,6 +1050,8 @@ def pair_download_plan(device: str, model: str, estimated_size_bytes: Annotated[
     configured = management.devices()
     if device not in configured:
         raise ValueError('Unknown device. Use pair_devices and an exact configured ID')
+    if configured[device].get('engine', 'lmstudio') != 'lmstudio':
+        raise ValueError('Model downloads are supported only for LM Studio devices')
     files = download_review.model_files(model, quantization)
     verified_bytes = files.get('size_bytes') if files['status'] == 'verified_file' else None
     planning_bytes = verified_bytes or estimated_size_bytes
@@ -1025,6 +1088,8 @@ def pair_download(plan_id: str, confirm_model: str) -> dict:
             current.get(key) != plan['verified_file'].get(key) for key in ('revision', 'file', 'size_bytes')
         ):
             raise ValueError('Hugging Face file metadata changed or is unavailable; prepare a new download plan')
+    if management.engine_for(device) != 'lmstudio':
+        raise ValueError('Model downloads are supported only for LM Studio devices')
     space = download_review.destination_space(management.devices()[device], plan['destination'],
                                               round(plan['estimated_size_bytes'] * 1.1))
     if space['status'] == 'insufficient':
@@ -1043,6 +1108,8 @@ def pair_download_status(device: str, job_id: str) -> dict:
     """Read the progress of an explicitly started LM Studio download job."""
     if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', job_id):
         raise ValueError('Invalid download job ID')
+    if management.engine_for(device) != 'lmstudio':
+        raise ValueError('Model downloads are supported only for LM Studio devices')
     with management.client(device) as c:
         result = management.request(c, 'GET', '/api/v1/models/download/status/' + job_id)
     return {'device': device, 'job_id': job_id, **{k: result[k] for k in

@@ -1,4 +1,6 @@
 import unittest
+import asyncio
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -32,6 +34,27 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'may still be running'):
                 server.request('POST', '/chat/completions', {})
             self.assertEqual(client.request.call_count, 1)
+
+    def test_unsloth_job_stream_consumes_openai_sse_text_only(self):
+        events = [
+            {'choices': [{'delta': {'content': 'answer '}}]},
+            {'choices': [{'delta': {'reasoning_content': 'hidden'}, 'finish_reason': None}]},
+            {'choices': [{'delta': {'content': 'complete'}, 'finish_reason': None}]},
+        ]
+        body = ''.join('data: ' + json.dumps(event) + '\n\n' for event in events) + 'data: [DONE]\n\n'
+        async def handle(request):
+            self.assertEqual(request.url.path, '/v1/chat/completions')
+            return httpx.Response(200, content=body.encode())
+        async def run():
+            job = server.jobs.Job('unsloth', 'publisher/model')
+            async with httpx.AsyncClient(base_url='http://unsloth',
+                                         transport=httpx.MockTransport(handle)) as client:
+                return await server._job_stream(job, client, 'synthetic-instance', 'prompt', 128), job
+        with patch.object(server.management, 'engine_for', return_value='unsloth'), \
+             patch.object(server.management, 'chat_model_id', return_value='publisher/model'):
+            answer, job = asyncio.run(run())
+        self.assertEqual(answer, 'answer complete')
+        self.assertEqual(job.answer, 'answer complete')
 
     def test_lock_rejects_overlap(self):
         with server.inference_lock():
@@ -173,6 +196,7 @@ class BridgeTests(unittest.TestCase):
         row = {'key': 'warm', 'type': 'llm', 'loaded_instances': [{'id': 'warm-i'}]}
         snapshot = {'devices': [{'device': 'mac', 'online': True, 'models': [row]}]}
         with patch.object(server, 'pair_devices', return_value=snapshot), patch.object(server.management, 'client') as factory, \
+             patch.object(server.management, 'devices', return_value={'mac': {}}), \
              patch.object(server.management, 'find_model', return_value=row), patch.object(server.management, 'request', return_value={
                  'model': 'warm', 'choices': [{'message': {'content': 'answer'}, 'finish_reason': 'stop'}]}) as req:
             factory.return_value.__enter__.return_value = object()
