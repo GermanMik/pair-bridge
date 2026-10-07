@@ -235,6 +235,41 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(recovered['status'], 'failed')
             self.assertNotIn('PRIVATE PROMPT', (Path(tmp) / 'jobs.jsonl').read_text())
 
+    def test_pair_load_verification_failure_reports_confirmed_releases(self):
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        records = [{'model': 'allowed', 'instance_id': 'old-i'}]
+        with patch.object(server.management, 'client'), \
+             patch.object(server.management, 'devices', return_value={'pc': {}}), \
+             patch.object(server.management, 'models', return_value=[cold]), \
+             patch.object(server.management, 'preflight_for_load', return_value={'candidate': cold, 'memory': {}, 'auto_unloaded_instances': records}), \
+             patch.object(server.management, 'load_with_auto_unload', return_value={'result': {}, 'auto_unloaded_instances': []}), \
+             patch.object(server.management, 'find_model', side_effect=ValueError('Inventory unavailable')):
+            with self.assertRaisesRegex(ValueError, 'allowed.*old-i') as failure:
+                server.pair_load('pc', 'candidate')
+        self.assertEqual(failure.exception.auto_unloaded_instances, records)
+
+    def test_job_rejects_wrong_or_missing_lmstudio_load_id_without_ownership(self):
+        import jobs
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        live = dict(cold, loaded_instances=[{'id': 'external-i'}])
+        for response_id in [None, '', 'different-i']:
+            with self.subTest(response_id=response_id), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(jobs, 'journal_path', return_value=Path(tmp) / 'jobs.jsonl'), \
+                 patch.object(server.management, 'client'), \
+                 patch.object(server.management, 'devices', return_value={'pc': {}}), \
+                 patch.object(server.management, 'models', return_value=[cold]), \
+                 patch.object(server.management, 'preflight_for_load', return_value={'candidate': cold, 'auto_unloaded_instances': []}), \
+                 patch.object(server.management, 'load_with_auto_unload', return_value={'result': {'instance_id': response_id}, 'auto_unloaded_instances': []}), \
+                 patch.object(server.management, 'find_model', return_value=live), \
+                 patch.object(server.management, 'engine_for', return_value='lmstudio'), \
+                 patch.object(server.management, 'unload_model') as unload:
+                job = jobs.Job('pc', 'candidate')
+                server._run_job(job, 'PRIVATE PROMPT', 8192, 2048, True)
+                self.assertEqual(job.status, 'failed')
+                self.assertFalse(job.owned)
+                self.assertIsNone(job.instance_id)
+                unload.assert_not_called()
+
     def test_failed_job_preflight_preserves_unloads_in_recovery(self):
         import jobs
         cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
@@ -453,6 +488,23 @@ class ConfigTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mcp_load_error_serializes_confirmed_preflight_releases(self):
+        from mcp import types
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        occupied = {'key': 'allowed', 'loaded_instances': [{'id': 'old-i'}]}
+        with patch.object(server.management, 'client'), \
+             patch.object(server.management, 'devices', return_value={'pc': {'auto_unload_models': ['allowed']}}), \
+             patch.object(server.management, 'models', side_effect=[[cold], [cold, occupied], [cold, occupied], [cold]]), \
+             patch.object(server.management, 'memory_preflight', side_effect=[ValueError('Insufficient currently available GPU memory'), ValueError('Estimator unavailable')]), \
+             patch.object(server.management, 'unload_model'):
+            request = types.CallToolRequest(method='tools/call', params=types.CallToolRequestParams(name='pair_load', arguments={'device': 'pc', 'model': 'candidate'}))
+            response = await server.mcp._mcp_server.request_handlers[types.CallToolRequest](request)
+        wire = response.model_dump_json()
+        self.assertTrue(response.root.isError)
+        self.assertIn('allowed', wire)
+        self.assertIn('old-i', wire)
+        self.assertIn('Estimator unavailable', wire)
+
     async def test_mcp_handshake_and_schema(self):
         import sys
         from mcp import ClientSession, StdioServerParameters

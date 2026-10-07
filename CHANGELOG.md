@@ -10,7 +10,9 @@
 - Report confirmed allowlisted unloads cumulatively across rejected smart-selection candidates, with device provenance.
 - Recognize Unsloth's native GPU-fit shortage message in deferred successful-HTTP load responses.
 - Preserve confirmed allowlisted unload records when a load retry or job preflight fails, including prompt-free job recovery journals.
-- Validation: 77 tests passed in the release checkout; 79 passed in the local checkout with existing desktop authentication.
+- Require exact LM Studio load-response instance ownership before background job cleanup.
+- Include confirmed releases in MCP-visible errors throughout synchronous preflight, load and verification failures.
+- Validation: 80 tests passed in the release checkout; 82 passed in the local checkout with existing desktop authentication.
 
 ## 0.7.2
 

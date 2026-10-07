@@ -243,6 +243,10 @@ def load_with_auto_unload(c, device_id, model_key, context_length, model_type, d
         return _load_with_auto_unload(c, device_id, model_key, context_length, model_type, device_config, unloaded)
     except ValueError as exc:
         exc.auto_unloaded_instances = list(unloaded)
+        if unloaded:
+            error = ValueError(f'{exc}; confirmed configured releases: {describe_unloaded_instances(unloaded)}')
+            error.auto_unloaded_instances = list(unloaded)
+            raise error from exc
         raise
 
 
@@ -428,6 +432,23 @@ def is_capacity_error(error):
     ))
 
 
+@contextlib.contextmanager
+def report_releases_on_error(records):
+    """Keep confirmed releases visible through synchronous MCP error serialization."""
+    try:
+        yield
+    except ValueError as exc:
+        released = list(records())
+        for row in getattr(exc, 'auto_unloaded_instances', []):
+            if row not in released:
+                released.append(row)
+        if released:
+            error = ValueError(f'{exc}; confirmed configured releases: {describe_unloaded_instances(released)}')
+            error.auto_unloaded_instances = released
+            raise error from exc
+        raise
+
+
 def describe_unloaded_instances(instances):
     return ', '.join(f"{row['model']} [{row['instance_id']}]" for row in instances)
 
@@ -441,6 +462,10 @@ def preflight_for_load(c, device_id, model_key, context_length, device_config,
                                    max_loaded_bytes, capacity, capacity_sampler, unloaded)
     except ValueError as exc:
         exc.auto_unloaded_instances = list(unloaded)
+        if unloaded:
+            error = ValueError(f'{exc}; confirmed configured releases: {describe_unloaded_instances(unloaded)}')
+            error.auto_unloaded_instances = list(unloaded)
+            raise error from exc
         raise
 
 
