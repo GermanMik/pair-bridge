@@ -231,7 +231,6 @@ def load_model(c, device_id, model_key, context_length, model_type='llm'):
             'model_path': model_key,
             'n_ctx': context_length,
             'max_seq_length': context_length,
-            'load_in_4bit': True,
         })
     body = {'model': model_key}
     if model_type == 'llm':

@@ -127,13 +127,25 @@ class ManagementTests(unittest.TestCase):
             self.assertEqual(request.call_args.args[2], '/api/inference/load')
             self.assertEqual(request.call_args.args[3], {
                 'model_path': 'publisher/model', 'n_ctx': 8192,
-                'max_seq_length': 8192, 'load_in_4bit': True,
+                'max_seq_length': 8192,
             })
             management.unload_model(connection, 'local', 'publisher/model', 'instance')
             self.assertEqual(request.call_args.args[2], '/api/inference/unload')
             self.assertEqual(request.call_args.args[3], {'model_path': 'publisher/model'})
             self.assertEqual(management.chat_model_id('local', 'publisher/model', 'instance'),
                              'publisher/model')
+
+    def test_unsloth_load_omits_precision_for_cold_default_and_resident_inheritance(self):
+        for resident_precision in [None, False]:
+            with self.subTest(resident_precision=resident_precision), \
+                 patch.object(management, 'engine_for', return_value='unsloth'), \
+                 patch.object(management, 'request') as request:
+                request.return_value = {'status': 'loaded' if resident_precision is None else 'already_loaded'}
+                result = management.load_model(object(), 'pc', 'candidate', 8192)
+                body = request.call_args.args[3]
+                self.assertNotIn('load_in_4bit', body)
+                self.assertEqual(body, {'model_path': 'candidate', 'n_ctx': 8192, 'max_seq_length': 8192})
+                self.assertEqual(result['status'], 'loaded' if resident_precision is None else 'already_loaded')
 
     def test_unsloth_load_failure_releases_only_allowlisted_exact_instance_then_retries(self):
         cold = {'key': 'candidate', 'loaded_instances': []}

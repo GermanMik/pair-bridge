@@ -16,7 +16,8 @@
 - Include device provenance in confirmed-release error text so identical IDs on different PCs remain distinguishable.
 - Preserve external Unsloth instances reused by already_loaded responses; reject unconfirmed load statuses before ownership.
 - Attribute every smart-ask postselection release to its exact selected device before merging records across PCs.
-- Validation: 86 tests passed in the release checkout; 88 passed in the local checkout with existing desktop authentication.
+- Omit unsolicited Unsloth quantization overrides, preserving native cold-load defaults and resident precision inheritance.
+- Validation: 88 tests passed in the release checkout; 90 passed in the local checkout with existing desktop authentication.
 
 ## 0.7.2
 

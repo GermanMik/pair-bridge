@@ -235,6 +235,47 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(recovered['status'], 'failed')
             self.assertNotIn('PRIVATE PROMPT', (Path(tmp) / 'jobs.jsonl').read_text())
 
+    def test_external_full_precision_race_uses_native_load_payload_and_preserves_smart_and_job_instance(self):
+        import jobs
+        from unittest.mock import Mock, AsyncMock
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        warm = dict(cold, loaded_instances=[{'id': 'foreign-16bit-i'}])
+        prepared = {'candidate': cold, 'memory': {}, 'auto_unloaded_instances': []}
+        def native_reply(c, method, route, body):
+            if route == '/api/inference/load':
+                self.assertNotIn('load_in_4bit', body)
+                self.assertEqual(body['max_seq_length'], 8192)
+                return {'status': 'already_loaded'}
+            self.assertEqual(route, '/v1/chat/completions')
+            return {'choices': [{'message': {'content': 'answer'}}]}
+        for mode in ['smart', 'job']:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(jobs, 'journal_path', return_value=Path(tmp) / 'jobs.jsonl'), \
+                 patch.object(server, 'catalog', return_value=[]), \
+                 patch.object(server, 'pair_devices', return_value={'devices': []}), \
+                 patch.object(server, 'select_model_for_memory', return_value=('pc', cold, {}, [], [])), \
+                 patch.object(server.management, 'client') as client, \
+                 patch.object(server.management, 'devices', return_value={'pc': {}}), \
+                 patch.object(server.management, 'engine_for', return_value='unsloth'), \
+                 patch.object(server.management, 'models', return_value=[cold]), \
+                 patch.object(server.management, 'preflight_for_load', return_value=prepared), \
+                 patch.object(server.management, 'find_model', side_effect=[cold, warm] if mode == 'smart' else [warm]), \
+                 patch.object(server.management, 'request', side_effect=native_reply), \
+                 patch.object(server, '_job_stream', new_callable=AsyncMock), \
+                 patch.object(server.management, 'unload_model') as unload:
+                client.return_value.__enter__.return_value = Mock(base_url='http://unsloth', headers={})
+                if mode == 'smart':
+                    result = server.pair_smart_ask('PRIVATE PROMPT')
+                    self.assertFalse(result['loaded_for_request'])
+                    self.assertEqual(result['cleanup'], 'existing_instance_preserved')
+                else:
+                    job = jobs.Job('pc', 'candidate')
+                    server._run_job(job, 'PRIVATE PROMPT', 8192, 2048, True)
+                    self.assertEqual(job.status, 'completed')
+                    self.assertFalse(job.owned)
+                    self.assertEqual(job.cleanup, 'existing_instance_preserved')
+                unload.assert_not_called()
+
     def test_unsloth_smart_reuse_preserves_foreign_instance_and_qualifies_all_releases(self):
         cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
         warm = dict(cold, loaded_instances=[{'id': 'foreign-i'}])
