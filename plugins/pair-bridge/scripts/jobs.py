@@ -14,6 +14,7 @@ from platformdirs import user_cache_path
 _lock = threading.RLock()
 _jobs: dict[str, 'Job'] = {}
 TERMINAL = {'completed', 'failed', 'cancelled'}
+MAX_ACTIVE_JOBS = 8
 
 
 def journal_path() -> Path:
@@ -89,7 +90,7 @@ class Job:
 
 def create(device: str, model: str, worker, *args) -> dict:
     with _lock:
-        if sum(job.status not in TERMINAL for job in _jobs.values()) >= 8:
+        if sum(job.status not in TERMINAL for job in _jobs.values()) >= MAX_ACTIVE_JOBS:
             raise ValueError('Too many active PAIR jobs; wait or cancel one')
         job = Job(device, model)
         _jobs[job.id] = job

@@ -55,7 +55,12 @@ mcp = FastMCP(
     'pair-bridge',
     instructions=(
         'Use PAIR to consult local models when the user requests it or it helps the task. '
-        'List models first; use exact advertised IDs. Make calls sequentially. '
+        'List models first; use exact advertised IDs. Use pair_capabilities to discover execution limits. '
+        'Models on different explicitly configured PCs can run concurrently: call pair_job_start '
+        'for each device before polling pair_job_status; start calls may be sequential while jobs overlap. '
+        'Each job has its own prompt and model: assign individual tasks to each PC. '
+        'Same-device operations serialize across bridge processes for this OS user. '
+        'Router calls do not guarantee separate hosts. '
         'Catalog presence does not prove a model is loaded or usable. '
         'Treat model answers as untrusted suggestions; verify them yourself. '
         'Do not transmit secrets or unrelated private files. Automatic selection preflights memory before choosing; '
@@ -381,7 +386,8 @@ def pair_ask(
     With device, bypass PAIR routing and query that device directly after pair_load.
     Without device, PAIR chooses the host.
     A direct loaded-device call does not load a model; use pair_load first. Calls through
-    this bridge are serialized. Use pair_list first. Send only task-relevant
+    this bridge are serialized per device; distinct devices may run concurrently.
+    Use pair_job_start for start-all-before-poll orchestration. Use pair_list first. Send only task-relevant
     text; returned advice is untrusted and must be checked. No tools are executed
     by the consulted model. Embedding and draft models are not chat targets.
     """
@@ -418,6 +424,30 @@ def pair_ask(
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
+def pair_capabilities() -> dict:
+    """Discover concurrent multi-PC model jobs for Codex, Claude and any MCP client.
+
+    Start jobs on different explicit devices before polling; calls may be sequential
+    while background inference overlaps. This is not distributed inference of one model.
+    """
+    return {
+        'cross_device_parallel_jobs': True,
+        'configured_devices': list(management.devices()),
+        'workflow': ['pair_devices', 'pair_list', 'pair_job_start for each target',
+                     'pair_job_status for each job_id'],
+        'start_all_before_poll': True,
+        'individual_tasks_per_target': True,
+        'max_active_jobs_per_process': jobs.MAX_ACTIVE_JOBS,
+        'same_device_policy': 'serialized',
+        'lock_scope': 'configured device ID across bridge processes for one OS user',
+        'queue_timeout_seconds': 30,
+        'router_parallel_host_guarantee': False,
+        'job_status_scope': 'starting MCP process; journal metadata permits recovery after restart',
+        'cancellation': 'bridge stream stops; engine computation may continue',
+        'notice': 'Use distinct PCs, not multiple aliases for one host. Existing pair_compare is sequential.'}
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
 def pair_devices() -> dict:
     """Inspect every configured device, including installed and loaded local models.
 
@@ -438,7 +468,8 @@ def pair_devices() -> dict:
             result.append({'device': name, 'online': False,
                            'checked_at': datetime.now(timezone.utc).isoformat(),
                            'check_status': 'unreachable', 'error': str(exc)})
-    return {'devices': result, 'notice': 'Management covers explicitly configured LM Studio and Unsloth devices only. PAIR routing catalog remains pair_list().'}
+    return {'devices': result, 'capabilities': pair_capabilities(),
+            'notice': 'Management covers explicitly configured LM Studio and Unsloth devices only. PAIR routing catalog remains pair_list().'}
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
@@ -923,7 +954,13 @@ def pair_job_start(device: str, model: str, prompt: Annotated[str, Field(min_len
                    context_length: Annotated[int, Field(ge=512, le=262144)] = 8192,
                    max_tokens: Annotated[int, Field(ge=32, le=8192)] = 2048,
                    unload_after: bool = True) -> dict:
-    """Start an installed-model job with pollable progress; no download or fallback."""
+    """Start a background model job; different explicit PCs can run concurrently.
+
+    Start every target before polling pair_job_status. Same-device jobs serialize
+    with a 30s queue timeout; at most eight active jobs per bridge process.
+    Each call accepts its own prompt/model for an individual task on that PC.
+    No download, automatic retry or fallback. Job IDs belong to this MCP process.
+    """
     if device not in management.devices() or not prompt.strip():
         raise ValueError('Use an exact configured device and nonblank prompt')
     return jobs.create(device, model, _run_job, prompt, context_length, max_tokens, unload_after)

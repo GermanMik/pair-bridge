@@ -32,6 +32,32 @@ Type `/pair` and choose the **pair** skill, or mention `$pair`. Astra, Sol, and 
 
 Independent community project. Not affiliated with or endorsed by OpenAI or NVIDIA.
 
+## Concurrent work across PCs
+
+Codex, Claude and other compatible MCP clients can run separate model tasks simultaneously on different configured PCs. `pair_capabilities` exposes this as machine-readable data, and `pair_devices` includes the same capabilities. Each PC can receive its own individual prompt and model choice; a shared task is not required. Discover exact device/model IDs first.
+
+1. Inspect `pair_capabilities`, `pair_devices`, and `pair_list(device=...)` for each target.
+2. Start `pair_job_start(device="pc_a", model="<installed key on pc_a>", prompt="task A")`.
+3. Start `pair_job_start(device="pc_b", model="<installed key on pc_b>", prompt="task B")` **before waiting for A**.
+4. Keep both job IDs and poll `pair_job_status` independently in the same MCP session. Cancel only the intended job with `pair_job_cancel`.
+
+Start calls may be sequential: jobs execute in background threads and overlap across devices. Up to eight active jobs per bridge process; operations on one device ID serialize across this OS user's bridge processes with a 30-second queue timeout. Use distinct physical PCs, not multiple aliases for one host. Router calls without an explicit device cannot guarantee different hosts. `pair_compare` remains sequential. This runs separate tasks, not one model distributed across PCs. A failed job does not cancel other jobs. Cancellation closes the bridge stream but engine computation may continue; inspect before retrying. After restart, journal metadata supports recovery, not recovery of the answer text.
+
+For any MCP client that accepts stdio servers, use `uv` with arguments `run`, `--locked`, `--script`, and the **absolute path** to `plugins/pair-bridge/scripts/server.py`. A common MCP configuration shape is:
+
+```json
+{
+  "mcpServers": {
+    "pair-bridge": {
+      "command": "uv",
+      "args": ["run", "--locked", "--script", "C:/Develop/PAIR/pair-bridge-pr/plugins/pair-bridge/scripts/server.py"]
+    }
+  }
+}
+```
+
+Adapt the path and enclosing configuration to your client. The server reads the existing `.pair-bridge.json` device configuration; no second PAIR broker is needed. Restart the MCP connection after updating server code so initialization instructions and tool schemas refresh. Already running plugin processes keep their old code until restarted.
+
 ## What does MCP actually do?
 
 **MCP means Model Context Protocol.** It is the interface through which compatible clients discover and call tools. In this project, a small MCP server runs on your computer and exposes tools for discovery, model lifecycle, and inference.

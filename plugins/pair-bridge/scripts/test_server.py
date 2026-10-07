@@ -375,13 +375,21 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         params = StdioServerParameters(command=sys.executable, args=[str(Path(server.__file__))])
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
+                initialized = await session.initialize()
+                self.assertIn('different explicitly configured PCs can run concurrently', initialized.instructions)
                 tools = (await session.list_tools()).tools
-                self.assertEqual({t.name for t in tools}, {'pair_list', 'pair_ask', 'pair_devices', 'pair_load', 'pair_unload', 'pair_memory_plan',
+                self.assertEqual({t.name for t in tools}, {'pair_capabilities', 'pair_list', 'pair_ask', 'pair_devices', 'pair_load', 'pair_unload', 'pair_memory_plan',
                                                           'pair_smart_ask', 'pair_compare', 'pair_diagnose',
                                                           'pair_download_plan', 'pair_download', 'pair_download_status',
                                                           'pair_decide', 'pair_score', 'pair_benchmark', 'pair_benchmark_results',
                                                           'pair_job_start', 'pair_job_status', 'pair_job_cancel', 'pair_job_recover'})
+                capability = next(t for t in tools if t.name == 'pair_capabilities')
+                self.assertTrue(capability.annotations.readOnlyHint)
+                self.assertIn('different explicit PCs can run concurrently', next(t for t in tools if t.name == 'pair_job_start').description)
+                result = await session.call_tool('pair_capabilities', {})
+                self.assertFalse(result.isError)
+                capabilities = result.structuredContent or json.loads(result.content[0].text)
+                self.assertTrue(capabilities['cross_device_parallel_jobs'])
                 result = await session.call_tool('pair_ask', {'model':'model','prompt':'hello','max_tokens':-1})
                 self.assertTrue(result.isError)
 
