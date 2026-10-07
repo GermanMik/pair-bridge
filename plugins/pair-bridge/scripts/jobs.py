@@ -14,6 +14,7 @@ from platformdirs import user_cache_path
 _lock = threading.RLock()
 _jobs: dict[str, 'Job'] = {}
 TERMINAL = {'completed', 'failed', 'cancelled'}
+MAX_ACTIVE_JOBS = 8
 
 
 def journal_path() -> Path:
@@ -40,6 +41,7 @@ class Job:
         self.instance_id = None
         self.owned = False
         self.cleanup = None
+        self.auto_unloaded_instances = []
         self.answer = ''
         self.error_code = None
         self.cancel_event = threading.Event()
@@ -57,7 +59,8 @@ class Job:
                     'created_at': self.created_at, 'updated_at': self.updated_at,
                     'status': self.status, 'stage': self.stage, 'progress': self.progress,
                     'instance_id': self.instance_id, 'loaded_for_job': self.owned,
-                    'cleanup': self.cleanup, 'error_code': self.error_code,
+                    'cleanup': self.cleanup, 'auto_unloaded_instances': self.auto_unloaded_instances,
+                    'error_code': self.error_code,
                     'answer': self.answer if self.status == 'completed' else None,
                     'partial_answer': self.answer[-4000:] if self.status in ('running', 'cancel_requested') else None}
 
@@ -87,7 +90,7 @@ class Job:
 
 def create(device: str, model: str, worker, *args) -> dict:
     with _lock:
-        if sum(job.status not in TERMINAL for job in _jobs.values()) >= 8:
+        if sum(job.status not in TERMINAL for job in _jobs.values()) >= MAX_ACTIVE_JOBS:
             raise ValueError('Too many active PAIR jobs; wait or cancel one')
         job = Job(device, model)
         _jobs[job.id] = job

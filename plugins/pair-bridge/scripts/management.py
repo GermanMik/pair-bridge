@@ -1,4 +1,4 @@
-"""Device-scoped LM Studio management; never starts a second PAIR broker."""
+"""Device-scoped local model engine management; never starts a second PAIR broker."""
 import contextlib
 import json
 import os
@@ -31,8 +31,8 @@ def devices():
         p = urlsplit(url)
         if p.scheme not in ('http', 'https') or not p.hostname or p.username or p.password or p.query or p.fragment or p.path not in ('', '/'):
             raise ValueError('Device base_url must be an HTTP(S) origin without credentials')
-        if row.get('engine', 'lmstudio') != 'lmstudio':
-            raise ValueError('This version supports LM Studio management only')
+        if row.get('engine', 'lmstudio') not in ('lmstudio', 'unsloth'):
+            raise ValueError('Device engine must be lmstudio or unsloth')
         host = row.get('ssh_host')
         if host is not None and (not isinstance(host, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', host)):
             raise ValueError('ssh_host must be an existing SSH config alias')
@@ -44,6 +44,12 @@ def devices():
         cap = row.get('max_loaded_bytes')
         if cap is not None and (not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0):
             raise ValueError('max_loaded_bytes must be a positive integer')
+        unload_models = row.get('auto_unload_models', [])
+        if (not isinstance(unload_models, list) or
+                any(not isinstance(model, str) or not model or model != model.strip() or len(model) > 512 or
+                    any(ch in model for ch in '\r\n\x00') for model in unload_models) or
+                len(set(unload_models)) != len(unload_models)):
+            raise ValueError('auto_unload_models must be a list of unique exact model keys')
         models_path = row.get('models_path')
         if models_path is not None and (not isinstance(models_path, str) or not models_path or len(models_path) > 512 or
                                         any(ch in models_path for ch in '\r\n\x00') or
@@ -51,6 +57,13 @@ def devices():
             raise ValueError('models_path must be a short absolute path configured by the user')
         result[name] = dict(row, base_url=url.rstrip('/'))
     return result
+
+
+def engine_for(device_id):
+    device = devices().get(device_id)
+    if device is None:
+        raise ValueError('Unknown device. Use pair_devices and an exact configured ID')
+    return device.get('engine', 'lmstudio')
 
 
 @contextlib.contextmanager
@@ -120,17 +133,77 @@ def request(c, method, route, body=None):
     except httpx.RequestError as exc:
         raise ValueError('Device engine is unreachable') from exc
     if not r.is_success:
+        if (method == 'POST' and route in ('/api/v1/models/load', '/api/inference/load') and
+                _response_reports_capacity_error(r)):
+            raise ValueError('Device reports insufficient available memory for this model; load was not confirmed')
         raise ValueError(f'Device returned HTTP {r.status_code}; no retry was made')
     try:
         data = r.json()
     except ValueError as exc:
         raise ValueError('Device returned invalid JSON') from exc
+    if isinstance(data, dict) and data.get('_deferred_error'):
+        if method == 'POST' and route == '/api/inference/load' and _response_reports_capacity_error(r):
+            raise ValueError('Device reports insufficient available memory for this model; load was not confirmed')
+        raise ValueError('Device returned a deferred error; operation was not confirmed')
     if not isinstance(data, dict) or 'error' in data:
         raise ValueError('Device returned an error or invalid response')
     return data
 
 
-def models(c):
+def _response_reports_capacity_error(response):
+    try:
+        detail = response.text[:8192].lower()
+    except Exception:
+        return False
+    native_shortage = re.search(
+        r'this model needs about \d+(?:\.\d+)? gb of gpu memory at a \d+ context, '
+        r'and \d+(?:\.\d+)? gb is free next to the models already loaded\.', detail)
+    free_shortage = re.search(
+        r'(?:not enough|insufficient) (?:free |available |currently available )?(?:gpu |cuda |vram )?memory', detail)
+    return bool(native_shortage or free_shortage) or any(marker in detail for marker in (
+        'out of memory', 'not enough memory', 'insufficient memory',
+        'failed to allocate', 'cannot allocate memory', 'cuda error: out of memory',
+        'cublas_status_alloc_failed', 'hip out of memory',
+        'no single gpu has enough free memory',
+    ))
+
+
+def _unsloth_model_type(row):
+    model_id = row['id'].lower()
+    task = row.get('task')
+    task = re.sub(r'[_\s]+', '-', task.lower()) if isinstance(task, str) else ''
+    if any(term in model_id or term in task for term in ('embed', 'rerank')):
+        return 'embedding'
+    if any(term in model_id or term in task for term in ('dflash', 'draft')):
+        return 'draft'
+    if task and task not in ('text-generation', 'text-generation-inference', 'conversational', 'chat', 'llm'):
+        return 'other'
+    return 'llm'
+
+
+def models(c, device_id=None):
+    if device_id is not None and engine_for(device_id) == 'unsloth':
+        rows = request(c, 'GET', '/v1/models').get('data')
+        if not isinstance(rows, list):
+            raise ValueError('Unsloth Studio OpenAI models API is required')
+        out = []
+        for row in rows:
+            if (not isinstance(row, dict) or not isinstance(row.get('id'), str) or
+                    not row['id'] or not isinstance(row.get('loaded'), bool)):
+                raise ValueError('Invalid Unsloth model inventory; cannot determine loaded state')
+            item = {'key': row['id'], 'type': _unsloth_model_type(row),
+                    'loaded_instances': ([{'id': row['id'], 'config': {
+                        'context_length': row['context_length']
+                    } if isinstance(row.get('context_length'), int) and not isinstance(row.get('context_length'), bool) else {}}]
+                                         if row['loaded'] else [])}
+            if isinstance(row.get('display_name'), str):
+                item['display_name'] = row['display_name']
+            if isinstance(row.get('max_context_length'), int) and not isinstance(row.get('max_context_length'), bool):
+                item['max_context_length'] = row['max_context_length']
+            if isinstance(row.get('size_bytes'), int) and not isinstance(row.get('size_bytes'), bool):
+                item['size_bytes'] = row['size_bytes']
+            out.append(item)
+        return out
     rows = request(c, 'GET', '/api/v1/models').get('models')
     if not isinstance(rows, list):
         raise ValueError('LM Studio native v1 API is required')
@@ -145,11 +218,109 @@ def models(c):
     return out
 
 
-def find_model(c, key):
-    rows = [m for m in models(c) if m['key'] == key]
+def find_model(c, key, device_id=None):
+    rows = [m for m in models(c, device_id) if m['key'] == key]
     if len(rows) != 1:
         raise ValueError('Model is not installed on this device. Refresh pair_list(device=...); no download was made')
     return rows[0]
+
+
+def load_model(c, device_id, model_key, context_length, model_type='llm'):
+    if engine_for(device_id) == 'unsloth':
+        return request(c, 'POST', '/api/inference/load', {
+            'model_path': model_key,
+            'n_ctx': context_length,
+            'max_seq_length': context_length,
+        })
+    body = {'model': model_key}
+    if model_type == 'llm':
+        body['context_length'] = context_length
+    return request(c, 'POST', '/api/v1/models/load', body)
+
+
+def load_with_auto_unload(c, device_id, model_key, context_length, model_type, device_config):
+    """Preserve confirmed releases on every failed load retry path."""
+    unloaded = []
+    try:
+        return _load_with_auto_unload(c, device_id, model_key, context_length, model_type, device_config, unloaded)
+    except ValueError as exc:
+        exc.auto_unloaded_instances = list(unloaded)
+        if unloaded:
+            error = ValueError(f'{exc}; confirmed configured releases: {describe_unloaded_instances(unloaded)}')
+            error.auto_unloaded_instances = list(unloaded)
+            raise error from exc
+        raise
+
+
+def _load_with_auto_unload(c, device_id, model_key, context_length, model_type, device_config, unloaded):
+    """Retry a load only after a confirmed capacity failure and exact configured unloads."""
+    try:
+        return {'result': load_model(c, device_id, model_key, context_length, model_type),
+                'auto_unloaded_instances': []}
+    except ValueError as exc:
+        if not is_capacity_error(exc):
+            raise
+        last_error = exc
+
+    allowed = device_config.get('auto_unload_models', [])
+    if not allowed:
+        raise last_error
+    for allowed_key in allowed:
+        if allowed_key == model_key:
+            continue
+        rows = models(c, device_id)
+        candidate = next((row for row in rows if row['key'] == model_key), None)
+        if candidate is None:
+            raise ValueError('Candidate model disappeared after capacity failure; no retry was made')
+        if candidate['loaded_instances']:
+            raise ValueError(f'{last_error}; candidate now appears loaded, inspect its state before retrying')
+        while True:
+            candidate = next((row for row in rows if row['key'] == model_key), None)
+            if candidate is None:
+                raise ValueError('Candidate model disappeared after capacity failure; no retry was made')
+            if candidate['loaded_instances']:
+                raise ValueError(f'{last_error}; candidate now appears loaded, inspect its state before retrying')
+            target = next((row for row in rows if row['key'] == allowed_key and row['loaded_instances']), None)
+            if target is None:
+                break
+            instance_id = target['loaded_instances'][0]['id']
+            unload_model(c, device_id, allowed_key, instance_id)
+            rows = models(c, device_id)
+            if any(instance['id'] == instance_id for row in rows for instance in row['loaded_instances']):
+                raise ValueError('Configured auto-unload did not remove the exact instance; load was not retried')
+            unloaded.append({'model': allowed_key, 'instance_id': instance_id})
+            candidate = next((row for row in rows if row['key'] == model_key), None)
+            if candidate is None:
+                raise ValueError('Candidate model disappeared after capacity failure; no retry was made')
+            if candidate['loaded_instances']:
+                raise ValueError(f'{last_error}; candidate now appears loaded, inspect its state before retrying')
+            try:
+                result = load_model(c, device_id, model_key, context_length, model_type)
+                return {'result': result, 'auto_unloaded_instances': unloaded}
+            except ValueError as exc:
+                if not is_capacity_error(exc):
+                    details = describe_unloaded_instances(unloaded)
+                    if details:
+                        raise ValueError(f'{exc}; configured auto_unload_models released: {details}') from exc
+                    raise
+                last_error = exc
+                rows = models(c, device_id)
+
+    if unloaded:
+        raise ValueError(f'{last_error}; configured auto_unload_models did not free enough memory '
+                         f'after releasing: {describe_unloaded_instances(unloaded)}')
+    raise last_error
+
+
+def unload_model(c, device_id, model_key, instance_id):
+    if engine_for(device_id) == 'unsloth':
+        return request(c, 'POST', '/api/inference/unload', {'model_path': model_key})
+    return request(c, 'POST', '/api/v1/models/unload', {'instance_id': instance_id})
+
+
+def chat_model_id(device_id, model_key, instance_id):
+    """Return the engine's accepted model identifier for OpenAI chat calls."""
+    return model_key if engine_for(device_id) == 'unsloth' else instance_id
 
 
 def ensure_capacity(rows, candidate, max_loaded_bytes):
@@ -163,13 +334,31 @@ def ensure_capacity(rows, candidate, max_loaded_bytes):
 
 
 def estimate_memory(device_id, model, context_length):
-    """Ask the target LM Studio CLI for a read-only memory estimate."""
-    cli = shutil.which('lms') or str(Path.home() / '.lmstudio' / 'bin' / 'lms')
-    if not Path(cli).is_file():
-        raise ValueError('LM Studio CLI is unavailable; memory estimate is unknown')
+    """Ask the configured engine for a read-only memory estimate."""
     if not isinstance(context_length, int) or context_length < 1:
         raise ValueError('A positive planned context length is required')
     device = devices()[device_id]
+    if device.get('engine', 'lmstudio') == 'unsloth':
+        with client(device_id) as c:
+            data = request(c, 'POST', '/api/inference/estimate-memory', {
+                'model_path': model, 'n_ctx': context_length,
+                'max_seq_length': context_length,
+            })
+        if data.get('available') is not True:
+            reason = data.get('reason')
+            safe_reason = reason if isinstance(reason, str) and re.fullmatch(r'[a-z_]{1,64}', reason) else 'unavailable'
+            raise ValueError(f'Unsloth Studio cannot estimate this model at the planned context ({safe_reason})')
+        total_bytes, gpu_bytes = data.get('total_bytes'), data.get('gpu_bytes')
+        if (not isinstance(total_bytes, int) or isinstance(total_bytes, bool) or total_bytes <= 0 or
+                not isinstance(gpu_bytes, int) or isinstance(gpu_bytes, bool) or gpu_bytes < 0 or
+                data.get('kv_estimable') is False or data.get('drafter_kv_unsized') is True or
+                data.get('adapters_unsized') is True):
+            raise ValueError('Unsloth Studio returned an incomplete memory estimate')
+        return {'total_bytes': total_bytes, 'gpu_bytes': gpu_bytes,
+                'context_length': context_length, 'source': 'Unsloth Studio /api/inference/estimate-memory'}
+    cli = shutil.which('lms') or str(Path.home() / '.lmstudio' / 'bin' / 'lms')
+    if not Path(cli).is_file():
+        raise ValueError('LM Studio CLI is unavailable; memory estimate is unknown')
     with endpoint(device) as origin:
         p = urlsplit(origin)
         args = [cli, 'load', '--estimate-only', '--context-length', str(context_length),
@@ -232,3 +421,129 @@ def memory_preflight(device_id, rows, candidate, context_length, max_loaded_byte
             raise
         return {'status': 'unknown', 'reason': str(exc),
                 'note': 'No configured memory cap; loading may still fail or evict another instance.'}
+
+
+def is_capacity_error(error):
+    text = str(error)
+    return any(marker in text for marker in (
+        'Insufficient currently available',
+        'Device reports insufficient available memory',
+        'estimated memory limit would be exceeded',
+        'model-weight limit would be exceeded',
+        'Loaded instance context is unknown',
+    ))
+
+
+@contextlib.contextmanager
+def report_releases_on_error(records):
+    """Keep confirmed releases visible through synchronous MCP error serialization."""
+    try:
+        yield
+    except ValueError as exc:
+        released = list(records())
+        for row in getattr(exc, 'auto_unloaded_instances', []):
+            if row not in released:
+                released.append(row)
+        if released:
+            error = ValueError(f'{exc}; confirmed configured releases: {describe_unloaded_instances(released)}')
+            error.auto_unloaded_instances = released
+            raise error from exc
+        raise
+
+
+def describe_unloaded_instances(instances):
+    return ', '.join((f"{row['device']}/" if row.get('device') else '') +
+                     f"{row['model']} [{row['instance_id']}]" for row in instances)
+
+
+def device_releases(instances, device):
+    """Attribute local mutation records before mixing different PCs."""
+    return [dict(row, device=device) for row in instances]
+
+
+def load_creates_owned_instance(device, result):
+    """Unsloth can reuse an external client's load; only loaded confirms our creation."""
+    if engine_for(device) != 'unsloth':
+        return True
+    status = result.get('status')
+    if status not in ('loaded', 'already_loaded'):
+        raise ValueError('Unsloth load status is not confirmed; inspect pair_list before retrying')
+    return status == 'loaded'
+
+
+def preflight_for_load(c, device_id, model_key, context_length, device_config,
+                       max_loaded_bytes=None, capacity=None, capacity_sampler=None):
+    """Preserve confirmed unload records even if a later preflight step fails."""
+    unloaded = []
+    try:
+        return _preflight_for_load(c, device_id, model_key, context_length, device_config,
+                                   max_loaded_bytes, capacity, capacity_sampler, unloaded)
+    except ValueError as exc:
+        exc.auto_unloaded_instances = list(unloaded)
+        if unloaded:
+            error = ValueError(f'{exc}; confirmed configured releases: {describe_unloaded_instances(unloaded)}')
+            error.auto_unloaded_instances = list(unloaded)
+            raise error from exc
+        raise
+
+
+def _preflight_for_load(c, device_id, model_key, context_length, device_config,
+                        max_loaded_bytes, capacity, capacity_sampler, unloaded):
+    """Preflight a cold load and, only for exact allowlisted keys, unload instances until it fits."""
+    rows = models(c, device_id)
+    candidate = next((row for row in rows if row['key'] == model_key), None)
+    if candidate is None:
+        raise ValueError('Model is not installed on this device; refresh the model inventory')
+    try:
+        memory = memory_preflight(device_id, rows, candidate, context_length, max_loaded_bytes, capacity)
+        return {'rows': rows, 'candidate': candidate, 'memory': memory, 'auto_unloaded_instances': []}
+    except ValueError as exc:
+        if not is_capacity_error(exc):
+            raise
+        last_error = exc
+
+    allowed = device_config.get('auto_unload_models', [])
+    if not allowed:
+        raise last_error
+
+    for allowed_key in allowed:
+        if allowed_key == model_key:
+            continue
+        while True:
+            rows = models(c, device_id)
+            candidate = next((row for row in rows if row['key'] == model_key), None)
+            if candidate is None:
+                raise ValueError('Candidate model disappeared while making room; no load was started')
+            target = next((row for row in rows if row['key'] == allowed_key and row['loaded_instances']), None)
+            if target is None:
+                break
+            instance_id = target['loaded_instances'][0]['id']
+            try:
+                unload_model(c, device_id, allowed_key, instance_id)
+            except ValueError as exc:
+                details = describe_unloaded_instances(unloaded)
+                if details:
+                    raise ValueError(f'{exc}; already released configured instances: {details}') from exc
+                raise
+            rows = models(c, device_id)
+            if any(instance['id'] == instance_id for row in rows for instance in row['loaded_instances']):
+                raise ValueError('Configured auto-unload did not remove the exact instance; stopped before loading')
+            unloaded.append({'model': allowed_key, 'instance_id': instance_id})
+            candidate = next((row for row in rows if row['key'] == model_key), None)
+            if candidate is None:
+                raise ValueError('Candidate model disappeared while making room; no load was started')
+            current_capacity = capacity_sampler() if capacity_sampler else None
+            try:
+                memory = memory_preflight(device_id, rows, candidate, context_length,
+                                          max_loaded_bytes, current_capacity)
+                return {'rows': rows, 'candidate': candidate, 'memory': memory,
+                        'auto_unloaded_instances': unloaded}
+            except ValueError as exc:
+                if not is_capacity_error(exc):
+                    raise
+                last_error = exc
+
+    if unloaded:
+        raise ValueError(f'{last_error}; configured auto_unload_models did not free enough memory '
+                         f'after releasing: {describe_unloaded_instances(unloaded)}')
+    raise last_error

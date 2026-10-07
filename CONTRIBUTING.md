@@ -43,7 +43,7 @@ User-facing setup and behavior belong in `README.md` and `README.ru.md`; operati
 
 - Keep each pull request focused and explain the user-visible behavior it changes.
 - Add or update a regression test for behavior changes, including an error-path test where relevant.
-- Preserve explicit user control: asking a model must not silently download weights, substitute another model, or unload an instance the bridge did not load for that request.
+- Preserve explicit user control: asking a model must not silently download weights or replace an explicitly named model. Automatic selection must pass memory preflight. Unload another instance only when its exact model key is in that device's `auto_unload_models` allowlist and preflight reports insufficient memory.
 - Never commit API keys, device addresses that identify private networks, real prompts, personal logs, or machine-specific configuration. Use synthetic examples and redact diagnostics.
 - If dependencies change, update the inline script metadata and lock file intentionally; CI uses `uv run --locked`.
 - Update the English and Russian documentation when setup, safety behavior, or user-visible tools change.

@@ -1,4 +1,6 @@
 import unittest
+import asyncio
+import json
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -32,6 +34,27 @@ class BridgeTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'may still be running'):
                 server.request('POST', '/chat/completions', {})
             self.assertEqual(client.request.call_count, 1)
+
+    def test_unsloth_job_stream_consumes_openai_sse_text_only(self):
+        events = [
+            {'choices': [{'delta': {'content': 'answer '}}]},
+            {'choices': [{'delta': {'reasoning_content': 'hidden'}, 'finish_reason': None}]},
+            {'choices': [{'delta': {'content': 'complete'}, 'finish_reason': None}]},
+        ]
+        body = ''.join('data: ' + json.dumps(event) + '\n\n' for event in events) + 'data: [DONE]\n\n'
+        async def handle(request):
+            self.assertEqual(request.url.path, '/v1/chat/completions')
+            return httpx.Response(200, content=body.encode())
+        async def run():
+            job = server.jobs.Job('unsloth', 'publisher/model')
+            async with httpx.AsyncClient(base_url='http://unsloth',
+                                         transport=httpx.MockTransport(handle)) as client:
+                return await server._job_stream(job, client, 'synthetic-instance', 'prompt', 128), job
+        with patch.object(server.management, 'engine_for', return_value='unsloth'), \
+             patch.object(server.management, 'chat_model_id', return_value='publisher/model'):
+            answer, job = asyncio.run(run())
+        self.assertEqual(answer, 'answer complete')
+        self.assertEqual(job.answer, 'answer complete')
 
     def test_lock_rejects_overlap(self):
         with server.inference_lock():
@@ -156,10 +179,245 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'No suitable installed'):
             server.select_model(rows, model='missing', task_hint='code')
 
+    def test_smart_selector_skips_ranked_model_that_fails_memory_preflight(self):
+        inventory = [{'device': 'pc', 'online': True, 'capacity': {'checked_at': 9999999999}, 'models': [
+            {'key': 'qwen', 'type': 'llm', 'size_bytes': 10, 'loaded_instances': []},
+            {'key': 'ornith', 'type': 'llm', 'size_bytes': 20, 'loaded_instances': []}]}]
+        with patch.object(server.management, 'devices', return_value={'pc': {}}), \
+             patch.object(server.management, 'memory_preflight', side_effect=[
+                 ValueError('Insufficient currently available GPU memory'), {'status': 'estimated'}]):
+            device, model, memory, unloaded, rejected = server.select_model_for_memory(inventory, 8192, 'general')
+        self.assertEqual((device, model['key']), ('pc', 'ornith'))
+        self.assertEqual(memory['status'], 'estimated')
+        self.assertEqual(unloaded, [])
+        self.assertEqual(len(rejected), 1)
+
+    def test_selector_reports_unloads_from_failed_candidate_before_later_success(self):
+        candidates = [{'key': key, 'type': 'llm', 'size_bytes': size, 'loaded_instances': []}
+                      for key, size in [('first', 1), ('second', 2)]]
+        inventory = [{'device': 'pc', 'online': True, 'models': candidates}]
+        failure = ValueError('Insufficient currently available GPU memory')
+        failure.auto_unloaded_instances = [{'model': 'allowed', 'instance_id': 'old-i'}]
+        prepared = {'candidate': candidates[1], 'memory': {'status': 'estimated'},
+                    'auto_unloaded_instances': [{'model': 'allowed2', 'instance_id': 'old2-i'}]}
+        with patch.object(server.management, 'devices', return_value={'pc': {'auto_unload_models': ['allowed']}}), \
+             patch.object(server.management, 'memory_preflight', side_effect=ValueError('Insufficient currently available GPU memory')), \
+             patch.object(server.management, 'client'), \
+             patch.object(server.management, 'preflight_for_load', side_effect=[failure, prepared]), \
+             patch.object(server, 'inference_lock'):
+            device, model, memory, unloaded, rejected = server.select_model_for_memory(inventory, 8192, 'general')
+        self.assertEqual(model['key'], 'second')
+        self.assertEqual(unloaded, [{'device': 'pc', 'model': 'allowed', 'instance_id': 'old-i'},
+                                    {'device': 'pc', 'model': 'allowed2', 'instance_id': 'old2-i'}])
+
+    def test_failed_job_load_retry_preserves_unloads_in_prompt_free_recovery_journal(self):
+        import jobs
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        occupied = {'key': 'allowed', 'loaded_instances': [{'id': 'old-i'}]}
+        released = {'key': 'allowed', 'loaded_instances': []}
+        prepared = {'candidate': cold, 'memory': {}, 'auto_unloaded_instances': []}
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(jobs, 'journal_path', return_value=Path(tmp) / 'jobs.jsonl'), \
+             patch.object(server.management, 'client'), \
+             patch.object(server.management, 'devices', return_value={'pc': {'auto_unload_models': ['allowed']}}), \
+             patch.object(server.management, 'preflight_for_load', return_value=prepared), \
+             patch.object(server.management, 'models', side_effect=[[cold], [cold, occupied], [cold, released]]), \
+             patch.object(server.management, 'load_model', side_effect=[ValueError('Device reports insufficient available memory'), ValueError('Device returned an error')]), \
+             patch.object(server.management, 'unload_model'):
+            job = jobs.Job('pc', 'candidate')
+            server._run_job(job, 'PRIVATE PROMPT', 8192, 2048, True)
+            expected = [{'model': 'allowed', 'instance_id': 'old-i'}]
+            self.assertEqual(job.snapshot()['status'], 'failed')
+            self.assertEqual(job.snapshot()['auto_unloaded_instances'], expected)
+            with patch.object(jobs, '_jobs', {}):
+                recovered = jobs.get(job.id)
+            self.assertEqual(recovered['auto_unloaded_instances'], expected)
+            self.assertEqual(recovered['status'], 'failed')
+            self.assertNotIn('PRIVATE PROMPT', (Path(tmp) / 'jobs.jsonl').read_text())
+
+    def test_external_full_precision_race_uses_native_load_payload_and_preserves_smart_and_job_instance(self):
+        import jobs
+        from unittest.mock import Mock, AsyncMock
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        warm = dict(cold, loaded_instances=[{'id': 'foreign-16bit-i'}])
+        prepared = {'candidate': cold, 'memory': {}, 'auto_unloaded_instances': []}
+        def native_reply(c, method, route, body):
+            if route == '/api/inference/load':
+                self.assertNotIn('load_in_4bit', body)
+                self.assertEqual(body['max_seq_length'], 8192)
+                return {'status': 'already_loaded'}
+            self.assertEqual(route, '/v1/chat/completions')
+            return {'choices': [{'message': {'content': 'answer'}}]}
+        for mode in ['smart', 'job']:
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(jobs, 'journal_path', return_value=Path(tmp) / 'jobs.jsonl'), \
+                 patch.object(server, 'catalog', return_value=[]), \
+                 patch.object(server, 'pair_devices', return_value={'devices': []}), \
+                 patch.object(server, 'select_model_for_memory', return_value=('pc', cold, {}, [], [])), \
+                 patch.object(server.management, 'client') as client, \
+                 patch.object(server.management, 'devices', return_value={'pc': {}}), \
+                 patch.object(server.management, 'engine_for', return_value='unsloth'), \
+                 patch.object(server.management, 'models', return_value=[cold]), \
+                 patch.object(server.management, 'preflight_for_load', return_value=prepared), \
+                 patch.object(server.management, 'find_model', side_effect=[cold, warm] if mode == 'smart' else [warm]), \
+                 patch.object(server.management, 'request', side_effect=native_reply), \
+                 patch.object(server, '_job_stream', new_callable=AsyncMock), \
+                 patch.object(server.management, 'unload_model') as unload:
+                client.return_value.__enter__.return_value = Mock(base_url='http://unsloth', headers={})
+                if mode == 'smart':
+                    result = server.pair_smart_ask('PRIVATE PROMPT')
+                    self.assertFalse(result['loaded_for_request'])
+                    self.assertEqual(result['cleanup'], 'existing_instance_preserved')
+                else:
+                    job = jobs.Job('pc', 'candidate')
+                    server._run_job(job, 'PRIVATE PROMPT', 8192, 2048, True)
+                    self.assertEqual(job.status, 'completed')
+                    self.assertFalse(job.owned)
+                    self.assertEqual(job.cleanup, 'existing_instance_preserved')
+                unload.assert_not_called()
+
+    def test_unsloth_smart_reuse_preserves_foreign_instance_and_qualifies_all_releases(self):
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        warm = dict(cold, loaded_instances=[{'id': 'foreign-i'}])
+        prior = [{'device': 'pc_a', 'model': 'same', 'instance_id': 'same-i'}]
+        local = [{'model': 'same', 'instance_id': 'same-i'}]
+        for status in ['already_loaded', None]:
+            with self.subTest(status=status), \
+                 patch.object(server, 'catalog', return_value=[]), \
+                 patch.object(server, 'pair_devices', return_value={'devices': []}), \
+                 patch.object(server, 'select_model_for_memory', return_value=('pc_b', cold, {}, prior, [])), \
+                 patch.object(server.management, 'client'), \
+                 patch.object(server.management, 'devices', return_value={'pc_b': {}}), \
+                 patch.object(server.management, 'engine_for', return_value='unsloth'), \
+                 patch.object(server.management, 'find_model', side_effect=[cold, warm]), \
+                 patch.object(server.management, 'models', return_value=[cold]), \
+                 patch.object(server.management, 'preflight_for_load', return_value={'candidate': cold, 'memory': {}, 'auto_unloaded_instances': local}), \
+                 patch.object(server.management, 'load_with_auto_unload', return_value={'result': {'status': status}, 'auto_unloaded_instances': local}), \
+                 patch.object(server.management, 'request', return_value={'choices': [{'message': {'content': 'answer'}}]}) as request, \
+                 patch.object(server.management, 'unload_model') as unload:
+                if status is None:
+                    with self.assertRaisesRegex(ValueError, 'status is not confirmed'):
+                        server.pair_smart_ask('PRIVATE PROMPT')
+                    request.assert_not_called()
+                else:
+                    result = server.pair_smart_ask('PRIVATE PROMPT')
+                    self.assertFalse(result['loaded_for_request'])
+                    self.assertEqual(result['cleanup'], 'existing_instance_preserved')
+                    self.assertEqual({row['device'] for row in result['auto_unloaded_instances']}, {'pc_a', 'pc_b'})
+                unload.assert_not_called()
+
+    def test_unsloth_job_reuse_never_owns_or_unloads_foreign_instance(self):
+        import jobs
+        from unittest.mock import Mock, AsyncMock
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        warm = dict(cold, loaded_instances=[{'id': 'foreign-i'}])
+        for status in ['already_loaded', None]:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(jobs, 'journal_path', return_value=Path(tmp) / 'jobs.jsonl'), \
+                 patch.object(server.management, 'client') as client, \
+                 patch.object(server.management, 'devices', return_value={'pc': {}}), \
+                 patch.object(server.management, 'engine_for', return_value='unsloth'), \
+                 patch.object(server.management, 'models', return_value=[cold]), \
+                 patch.object(server.management, 'preflight_for_load', return_value={'candidate': cold, 'auto_unloaded_instances': []}), \
+                 patch.object(server.management, 'load_with_auto_unload', return_value={'result': {'status': status}, 'auto_unloaded_instances': []}), \
+                 patch.object(server.management, 'find_model', return_value=warm), \
+                 patch.object(server, '_job_stream', new_callable=AsyncMock) as stream, \
+                 patch.object(server.management, 'unload_model') as unload:
+                client.return_value.__enter__.return_value = Mock(base_url='http://unsloth', headers={})
+                job = jobs.Job('pc', 'candidate')
+                server._run_job(job, 'PRIVATE PROMPT', 8192, 2048, True)
+                self.assertFalse(job.owned)
+                unload.assert_not_called()
+                if status is None:
+                    self.assertEqual(job.status, 'failed')
+                    stream.assert_not_called()
+                else:
+                    self.assertEqual(job.status, 'completed')
+                    self.assertEqual(job.cleanup, 'existing_instance_preserved')
+                    stream.assert_awaited_once()
+
+    def test_pair_load_verification_failure_reports_confirmed_releases(self):
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        records = [{'model': 'allowed', 'instance_id': 'old-i'}]
+        with patch.object(server.management, 'client'), \
+             patch.object(server.management, 'devices', return_value={'pc': {}}), \
+             patch.object(server.management, 'models', return_value=[cold]), \
+             patch.object(server.management, 'preflight_for_load', return_value={'candidate': cold, 'memory': {}, 'auto_unloaded_instances': records}), \
+             patch.object(server.management, 'load_with_auto_unload', return_value={'result': {}, 'auto_unloaded_instances': []}), \
+             patch.object(server.management, 'find_model', side_effect=ValueError('Inventory unavailable')):
+            with self.assertRaisesRegex(ValueError, 'allowed.*old-i') as failure:
+                server.pair_load('pc', 'candidate')
+        self.assertEqual(failure.exception.auto_unloaded_instances, records)
+
+    def test_job_rejects_wrong_or_missing_lmstudio_load_id_without_ownership(self):
+        import jobs
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        live = dict(cold, loaded_instances=[{'id': 'external-i'}])
+        for response_id in [None, '', 'different-i']:
+            with self.subTest(response_id=response_id), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(jobs, 'journal_path', return_value=Path(tmp) / 'jobs.jsonl'), \
+                 patch.object(server.management, 'client'), \
+                 patch.object(server.management, 'devices', return_value={'pc': {}}), \
+                 patch.object(server.management, 'models', return_value=[cold]), \
+                 patch.object(server.management, 'preflight_for_load', return_value={'candidate': cold, 'auto_unloaded_instances': []}), \
+                 patch.object(server.management, 'load_with_auto_unload', return_value={'result': {'instance_id': response_id}, 'auto_unloaded_instances': []}), \
+                 patch.object(server.management, 'find_model', return_value=live), \
+                 patch.object(server.management, 'engine_for', return_value='lmstudio'), \
+                 patch.object(server.management, 'unload_model') as unload:
+                job = jobs.Job('pc', 'candidate')
+                server._run_job(job, 'PRIVATE PROMPT', 8192, 2048, True)
+                self.assertEqual(job.status, 'failed')
+                self.assertFalse(job.owned)
+                self.assertIsNone(job.instance_id)
+                unload.assert_not_called()
+
+    def test_failed_job_preflight_preserves_unloads_in_recovery(self):
+        import jobs
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        failure = ValueError('Insufficient currently available GPU memory')
+        failure.auto_unloaded_instances = [{'model': 'allowed', 'instance_id': 'old-i'}]
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(jobs, 'journal_path', return_value=Path(tmp) / 'jobs.jsonl'), \
+             patch.object(server.management, 'client'), \
+             patch.object(server.management, 'devices', return_value={'pc': {}}), \
+             patch.object(server.management, 'models', return_value=[cold]), \
+             patch.object(server.management, 'preflight_for_load', side_effect=failure):
+            job = jobs.Job('pc', 'candidate')
+            server._run_job(job, 'PRIVATE PROMPT', 8192, 2048, True)
+            with patch.object(jobs, '_jobs', {}):
+                recovered = jobs.get(job.id)
+            self.assertEqual(recovered['auto_unloaded_instances'], failure.auto_unloaded_instances)
+            self.assertEqual(recovered['status'], 'failed')
+            self.assertNotIn('PRIVATE PROMPT', (Path(tmp) / 'jobs.jsonl').read_text())
+
+    def test_device_only_override_does_not_send_prompt_to_better_ranked_pc(self):
+        first = {'key': 'small', 'type': 'llm', 'size_bytes': 1, 'loaded_instances': [{'id': 'a'}]}
+        second = {'key': 'large', 'type': 'llm', 'size_bytes': 100, 'loaded_instances': [{'id': 'b'}]}
+        snapshot = {'devices': [{'device': 'pc_a', 'online': True, 'models': [first]},
+                                {'device': 'pc_b', 'online': True, 'models': [second]}]}
+        with patch.object(server, 'catalog', return_value=[]), \
+             patch.object(server, 'pair_devices', return_value=snapshot), \
+             patch.object(server.management, 'devices', return_value={'pc_a': {}, 'pc_b': {}}), \
+             patch.object(server.management, 'client') as client, \
+             patch.object(server.management, 'find_model', return_value=second), \
+             patch.object(server.management, 'request', return_value={
+                 'model': 'large', 'choices': [{'message': {'content': 'answer'}, 'finish_reason': 'stop'}]}):
+            result = server.pair_smart_ask('private task for B', device='pc_b')
+        self.assertEqual(result['device'], 'pc_b')
+        client.assert_called_once_with('pc_b')
+
+    def test_device_only_override_fails_closed_when_target_is_offline(self):
+        inventory = [{'device': 'pc_a', 'online': True, 'models': [
+            {'key': 'warm', 'type': 'llm', 'loaded_instances': [{'id': 'a'}]}]},
+                     {'device': 'pc_b', 'online': False, 'models': []}]
+        with self.assertRaisesRegex(ValueError, 'No suitable installed'):
+            server.select_model_for_memory(inventory, 8192, 'general', device='pc_b')
+
     def test_smart_ask_preserves_existing_instance(self):
         row = {'key': 'warm', 'type': 'llm', 'loaded_instances': [{'id': 'warm-i'}]}
         snapshot = {'devices': [{'device': 'mac', 'online': True, 'models': [row]}]}
         with patch.object(server, 'pair_devices', return_value=snapshot), patch.object(server.management, 'client') as factory, \
+             patch.object(server.management, 'devices', return_value={'mac': {}}), \
              patch.object(server.management, 'find_model', return_value=row), patch.object(server.management, 'request', return_value={
                  'model': 'warm', 'choices': [{'message': {'content': 'answer'}, 'finish_reason': 'stop'}]}) as req:
             factory.return_value.__enter__.return_value = object()
@@ -173,6 +431,8 @@ class BridgeTests(unittest.TestCase):
         warm = {'key': 'cold', 'type': 'llm', 'loaded_instances': [{'id': 'owned-i'}]}
         snapshot = {'devices': [{'device': 'mac', 'online': True, 'models': [cold]}]}
         responses = [cold, warm, warm, {'key': 'cold', 'type': 'llm', 'loaded_instances': []}]
+        prepared = {'rows': [cold], 'candidate': cold, 'memory': {'status': 'estimated'},
+                    'auto_unloaded_instances': []}
         def send(_c, _method, route, _body):
             if route == '/api/v1/models/load':
                 return {'instance_id': 'owned-i'}
@@ -183,6 +443,7 @@ class BridgeTests(unittest.TestCase):
              patch.object(server.management, 'find_model', side_effect=responses), \
              patch.object(server.management, 'models', side_effect=[[cold], [warm]]), \
              patch.object(server.management, 'devices', return_value={'mac': {}}), \
+             patch.object(server.management, 'preflight_for_load', return_value=prepared), \
              patch.object(server.management, 'request', side_effect=send) as req:
             factory.return_value.__enter__.return_value = object()
             result = server.pair_smart_ask('question')
@@ -195,6 +456,8 @@ class BridgeTests(unittest.TestCase):
         cold = {'key': 'cold', 'type': 'llm', 'loaded_instances': []}
         warm = {'key': 'cold', 'type': 'llm', 'loaded_instances': [{'id': 'owned-i'}]}
         snapshot = {'devices': [{'device': 'mac', 'online': True, 'models': [cold]}]}
+        prepared = {'rows': [cold], 'candidate': cold, 'memory': {'status': 'estimated'},
+                    'auto_unloaded_instances': []}
         def send(_c, _method, route, _body):
             if route == '/api/v1/models/load':
                 return {'instance_id': 'owned-i'}
@@ -205,6 +468,7 @@ class BridgeTests(unittest.TestCase):
              patch.object(server.management, 'find_model', side_effect=[cold, warm]), \
              patch.object(server.management, 'models', side_effect=[[cold], [warm]]), \
              patch.object(server.management, 'devices', return_value={'mac': {}}), \
+             patch.object(server.management, 'preflight_for_load', return_value=prepared), \
              patch.object(server.management, 'request', side_effect=send) as req:
             factory.return_value.__enter__.return_value = object()
             with self.assertRaisesRegex(ValueError, 'timed out'):
@@ -325,6 +589,68 @@ class ConfigTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mcp_selected_device_preflight_failure_preserves_both_device_labels(self):
+        from mcp import types
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        failure = ValueError('Estimator unavailable')
+        failure.auto_unloaded_instances = [{'model': 'same', 'instance_id': 'same-i'}]
+        with patch.object(server, 'catalog', return_value=[]), \
+             patch.object(server, 'pair_devices', return_value={'devices': []}), \
+             patch.object(server, 'select_model_for_memory', return_value=('pc_b', cold, {}, [{'device': 'pc_a', 'model': 'same', 'instance_id': 'same-i'}], [])), \
+             patch.object(server.management, 'devices', return_value={'pc_b': {}}), \
+             patch.object(server.management, 'client'), \
+             patch.object(server.management, 'find_model', return_value=cold), \
+             patch.object(server.management, 'models', return_value=[cold]), \
+             patch.object(server.management, 'preflight_for_load', side_effect=failure):
+            request = types.CallToolRequest(method='tools/call', params=types.CallToolRequestParams(name='pair_smart_ask', arguments={'prompt': 'PRIVATE PROMPT'}))
+            response = await server.mcp._mcp_server.request_handlers[types.CallToolRequest](request)
+        wire = response.model_dump_json()
+        self.assertTrue(response.root.isError)
+        self.assertIn('pc_a/same [same-i]', wire)
+        self.assertIn('pc_b/same [same-i]', wire)
+        self.assertNotIn('PRIVATE PROMPT', wire)
+
+    async def test_mcp_failed_selection_disambiguates_same_instance_across_devices(self):
+        from mcp import types
+        candidate = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        inventory = [{'device': device, 'online': True, 'models': [candidate]} for device in ['pc_a', 'pc_b']]
+        failures = []
+        for device in ['pc_a', 'pc_b']:
+            failure = ValueError('Insufficient currently available GPU memory')
+            failure.auto_unloaded_instances = [{'model': 'same', 'instance_id': 'same-i'}]
+            failures.append(failure)
+        with patch.object(server, 'catalog', return_value=[]), \
+             patch.object(server, 'pair_devices', return_value={'devices': inventory}), \
+             patch.object(server.management, 'devices', return_value={d: {'auto_unload_models': ['same']} for d in ['pc_a', 'pc_b']}), \
+             patch.object(server.management, 'client'), \
+             patch.object(server.management, 'memory_preflight', side_effect=ValueError('Insufficient currently available GPU memory')), \
+             patch.object(server.management, 'preflight_for_load', side_effect=failures), \
+             patch.object(server, 'inference_lock'):
+            request = types.CallToolRequest(method='tools/call', params=types.CallToolRequestParams(name='pair_smart_ask', arguments={'prompt': 'PRIVATE PROMPT'}))
+            response = await server.mcp._mcp_server.request_handlers[types.CallToolRequest](request)
+        wire = response.model_dump_json()
+        self.assertTrue(response.root.isError)
+        self.assertIn('pc_a/same [same-i]', wire)
+        self.assertIn('pc_b/same [same-i]', wire)
+        self.assertNotIn('PRIVATE PROMPT', wire)
+
+    async def test_mcp_load_error_serializes_confirmed_preflight_releases(self):
+        from mcp import types
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        occupied = {'key': 'allowed', 'loaded_instances': [{'id': 'old-i'}]}
+        with patch.object(server.management, 'client'), \
+             patch.object(server.management, 'devices', return_value={'pc': {'auto_unload_models': ['allowed']}}), \
+             patch.object(server.management, 'models', side_effect=[[cold], [cold, occupied], [cold, occupied], [cold]]), \
+             patch.object(server.management, 'memory_preflight', side_effect=[ValueError('Insufficient currently available GPU memory'), ValueError('Estimator unavailable')]), \
+             patch.object(server.management, 'unload_model'):
+            request = types.CallToolRequest(method='tools/call', params=types.CallToolRequestParams(name='pair_load', arguments={'device': 'pc', 'model': 'candidate'}))
+            response = await server.mcp._mcp_server.request_handlers[types.CallToolRequest](request)
+        wire = response.model_dump_json()
+        self.assertTrue(response.root.isError)
+        self.assertIn('allowed', wire)
+        self.assertIn('old-i', wire)
+        self.assertIn('Estimator unavailable', wire)
+
     async def test_mcp_handshake_and_schema(self):
         import sys
         from mcp import ClientSession, StdioServerParameters
@@ -332,13 +658,21 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
         params = StdioServerParameters(command=sys.executable, args=[str(Path(server.__file__))])
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
-                await session.initialize()
+                initialized = await session.initialize()
+                self.assertIn('different explicitly configured PCs can run concurrently', initialized.instructions)
                 tools = (await session.list_tools()).tools
-                self.assertEqual({t.name for t in tools}, {'pair_list', 'pair_ask', 'pair_devices', 'pair_load', 'pair_unload', 'pair_memory_plan',
+                self.assertEqual({t.name for t in tools}, {'pair_capabilities', 'pair_list', 'pair_ask', 'pair_devices', 'pair_load', 'pair_unload', 'pair_memory_plan',
                                                           'pair_smart_ask', 'pair_compare', 'pair_diagnose',
                                                           'pair_download_plan', 'pair_download', 'pair_download_status',
                                                           'pair_decide', 'pair_score', 'pair_benchmark', 'pair_benchmark_results',
                                                           'pair_job_start', 'pair_job_status', 'pair_job_cancel', 'pair_job_recover'})
+                capability = next(t for t in tools if t.name == 'pair_capabilities')
+                self.assertTrue(capability.annotations.readOnlyHint)
+                self.assertIn('different explicit PCs can run concurrently', next(t for t in tools if t.name == 'pair_job_start').description)
+                result = await session.call_tool('pair_capabilities', {})
+                self.assertFalse(result.isError)
+                capabilities = result.structuredContent or json.loads(result.content[0].text)
+                self.assertTrue(capabilities['cross_device_parallel_jobs'])
                 result = await session.call_tool('pair_ask', {'model':'model','prompt':'hello','max_tokens':-1})
                 self.assertTrue(result.isError)
 

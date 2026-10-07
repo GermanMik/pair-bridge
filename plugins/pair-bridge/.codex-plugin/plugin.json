@@ -1,20 +1,21 @@
 {
   "name": "pair-bridge",
-  "version": "0.7.0+codex.20260926175416",
-  "description": "Use local models across configured devices from Codex and Oh My Pi through PAIR.",
+  "version": "0.7.4",
+  "description": "Consult and manage local models through PAIR, including concurrent jobs across configured PCs for compatible MCP clients.",
   "author": {
     "name": "GermanMik"
   },
   "interface": {
     "displayName": "PAIR Bridge",
-    "shortDescription": "Consult and manage local models through PAIR.",
-    "longDescription": "Use /pair to inspect devices, choose installed models, compare answers, diagnose failures, and manage model instances safely.",
+    "shortDescription": "Run local model tasks concurrently across PCs.",
+    "longDescription": "Inspect devices, discover concurrency with pair_capabilities, start model jobs on different PCs before polling, and manage exact model instances.",
     "developerName": "GermanMik",
     "category": "Productivity",
     "capabilities": [],
     "defaultPrompt": [
       "Use pair_devices and pair_list to inspect installed local models.",
-      "Use pair_smart_ask for a bounded task with an installed model."
+      "Use pair_smart_ask for a bounded task with an installed model.",
+      "Use pair_capabilities, then start pair_job_start on different PCs before polling pair_job_status."
     ]
   },
   "mcpServers": "./.mcp.json",
