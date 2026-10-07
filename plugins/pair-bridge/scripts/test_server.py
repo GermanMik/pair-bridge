@@ -488,6 +488,30 @@ class ConfigTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mcp_failed_selection_disambiguates_same_instance_across_devices(self):
+        from mcp import types
+        candidate = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        inventory = [{'device': device, 'online': True, 'models': [candidate]} for device in ['pc_a', 'pc_b']]
+        failures = []
+        for device in ['pc_a', 'pc_b']:
+            failure = ValueError('Insufficient currently available GPU memory')
+            failure.auto_unloaded_instances = [{'model': 'same', 'instance_id': 'same-i'}]
+            failures.append(failure)
+        with patch.object(server, 'catalog', return_value=[]), \
+             patch.object(server, 'pair_devices', return_value={'devices': inventory}), \
+             patch.object(server.management, 'devices', return_value={d: {'auto_unload_models': ['same']} for d in ['pc_a', 'pc_b']}), \
+             patch.object(server.management, 'client'), \
+             patch.object(server.management, 'memory_preflight', side_effect=ValueError('Insufficient currently available GPU memory')), \
+             patch.object(server.management, 'preflight_for_load', side_effect=failures), \
+             patch.object(server, 'inference_lock'):
+            request = types.CallToolRequest(method='tools/call', params=types.CallToolRequestParams(name='pair_smart_ask', arguments={'prompt': 'PRIVATE PROMPT'}))
+            response = await server.mcp._mcp_server.request_handlers[types.CallToolRequest](request)
+        wire = response.model_dump_json()
+        self.assertTrue(response.root.isError)
+        self.assertIn('pc_a/same [same-i]', wire)
+        self.assertIn('pc_b/same [same-i]', wire)
+        self.assertNotIn('PRIVATE PROMPT', wire)
+
     async def test_mcp_load_error_serializes_confirmed_preflight_releases(self):
         from mcp import types
         cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}

@@ -79,6 +79,30 @@ class ManagementTests(unittest.TestCase):
             self.assertNotIn('private model path', str(error.exception))
             client.request.assert_called_once()
 
+    def test_native_free_gpu_shortage_is_capacity_but_unverifiable_training_is_not(self):
+        for status in [200, 409]:
+            for detail, capacity in [
+                ('Not enough free GPU memory to load this model while training is running (needs ~21 GB including safety headroom, ~3 GB free). PRIVATE PATH', True),
+                ('No single GPU has enough free memory for this native audio model. PRIVATE PATH', True),
+                ("Can't load this model while training is running: its GPU memory use could not be verified. PRIVATE PATH", False),
+                ('GPU memory was not released after the resident media model was stopped. PRIVATE PATH', False),
+            ]:
+                with self.subTest(status=status, detail=detail):
+                    client = Mock()
+                    client.request.return_value = httpx.Response(status, json={'_deferred_error': detail} if status == 200 else {'detail': detail})
+                    with self.assertRaises(ValueError) as failure:
+                        management.request(client, 'POST', '/api/inference/load', {})
+                    self.assertEqual(management.is_capacity_error(failure.exception), capacity)
+                    self.assertNotIn('PRIVATE PATH', str(failure.exception))
+                    client.request.assert_called_once()
+
+    def test_release_formatter_preserves_optional_device_and_legacy_records(self):
+        self.assertEqual(management.describe_unloaded_instances([
+            {'device': 'pc_a', 'model': 'same', 'instance_id': 'same-i'},
+            {'device': 'pc_b', 'model': 'same', 'instance_id': 'same-i'},
+            {'model': 'legacy', 'instance_id': 'legacy-i'}]),
+            'pc_a/same [same-i], pc_b/same [same-i], legacy [legacy-i]')
+
     def test_unsloth_estimate_uses_device_api_and_maps_complete_result(self):
         with patch.object(management, 'devices', return_value={'local': {'engine': 'unsloth'}}), \
              patch.object(management, 'client', return_value=self.scope()), \

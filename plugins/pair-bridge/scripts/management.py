@@ -158,10 +158,13 @@ def _response_reports_capacity_error(response):
     native_shortage = re.search(
         r'this model needs about \d+(?:\.\d+)? gb of gpu memory at a \d+ context, '
         r'and \d+(?:\.\d+)? gb is free next to the models already loaded\.', detail)
-    return bool(native_shortage) or any(marker in detail for marker in (
+    free_shortage = re.search(
+        r'(?:not enough|insufficient) (?:free |available |currently available )?(?:gpu |cuda |vram )?memory', detail)
+    return bool(native_shortage or free_shortage) or any(marker in detail for marker in (
         'out of memory', 'not enough memory', 'insufficient memory',
         'failed to allocate', 'cannot allocate memory', 'cuda error: out of memory',
         'cublas_status_alloc_failed', 'hip out of memory',
+        'no single gpu has enough free memory',
     ))
 
 
@@ -450,7 +453,8 @@ def report_releases_on_error(records):
 
 
 def describe_unloaded_instances(instances):
-    return ', '.join(f"{row['model']} [{row['instance_id']}]" for row in instances)
+    return ', '.join((f"{row['device']}/" if row.get('device') else '') +
+                     f"{row['model']} [{row['instance_id']}]" for row in instances)
 
 
 def preflight_for_load(c, device_id, model_key, context_length, device_config,

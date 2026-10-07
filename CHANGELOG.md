@@ -12,7 +12,9 @@
 - Preserve confirmed allowlisted unload records when a load retry or job preflight fails, including prompt-free job recovery journals.
 - Require exact LM Studio load-response instance ownership before background job cleanup.
 - Include confirmed releases in MCP-visible errors throughout synchronous preflight, load and verification failures.
-- Validation: 80 tests passed in the release checkout; 82 passed in the local checkout with existing desktop authentication.
+- Recognize native Unsloth free-GPU-memory shortage guards during training and native audio placement, preserving noncapacity refusals.
+- Include device provenance in confirmed-release error text so identical IDs on different PCs remain distinguishable.
+- Validation: 83 tests passed in the release checkout; 85 passed in the local checkout with existing desktop authentication.
 
 ## 0.7.2
 
