@@ -210,6 +210,50 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(unloaded, [{'device': 'pc', 'model': 'allowed', 'instance_id': 'old-i'},
                                     {'device': 'pc', 'model': 'allowed2', 'instance_id': 'old2-i'}])
 
+    def test_failed_job_load_retry_preserves_unloads_in_prompt_free_recovery_journal(self):
+        import jobs
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        occupied = {'key': 'allowed', 'loaded_instances': [{'id': 'old-i'}]}
+        released = {'key': 'allowed', 'loaded_instances': []}
+        prepared = {'candidate': cold, 'memory': {}, 'auto_unloaded_instances': []}
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(jobs, 'journal_path', return_value=Path(tmp) / 'jobs.jsonl'), \
+             patch.object(server.management, 'client'), \
+             patch.object(server.management, 'devices', return_value={'pc': {'auto_unload_models': ['allowed']}}), \
+             patch.object(server.management, 'preflight_for_load', return_value=prepared), \
+             patch.object(server.management, 'models', side_effect=[[cold], [cold, occupied], [cold, released]]), \
+             patch.object(server.management, 'load_model', side_effect=[ValueError('Device reports insufficient available memory'), ValueError('Device returned an error')]), \
+             patch.object(server.management, 'unload_model'):
+            job = jobs.Job('pc', 'candidate')
+            server._run_job(job, 'PRIVATE PROMPT', 8192, 2048, True)
+            expected = [{'model': 'allowed', 'instance_id': 'old-i'}]
+            self.assertEqual(job.snapshot()['status'], 'failed')
+            self.assertEqual(job.snapshot()['auto_unloaded_instances'], expected)
+            with patch.object(jobs, '_jobs', {}):
+                recovered = jobs.get(job.id)
+            self.assertEqual(recovered['auto_unloaded_instances'], expected)
+            self.assertEqual(recovered['status'], 'failed')
+            self.assertNotIn('PRIVATE PROMPT', (Path(tmp) / 'jobs.jsonl').read_text())
+
+    def test_failed_job_preflight_preserves_unloads_in_recovery(self):
+        import jobs
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        failure = ValueError('Insufficient currently available GPU memory')
+        failure.auto_unloaded_instances = [{'model': 'allowed', 'instance_id': 'old-i'}]
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(jobs, 'journal_path', return_value=Path(tmp) / 'jobs.jsonl'), \
+             patch.object(server.management, 'client'), \
+             patch.object(server.management, 'devices', return_value={'pc': {}}), \
+             patch.object(server.management, 'models', return_value=[cold]), \
+             patch.object(server.management, 'preflight_for_load', side_effect=failure):
+            job = jobs.Job('pc', 'candidate')
+            server._run_job(job, 'PRIVATE PROMPT', 8192, 2048, True)
+            with patch.object(jobs, '_jobs', {}):
+                recovered = jobs.get(job.id)
+            self.assertEqual(recovered['auto_unloaded_instances'], failure.auto_unloaded_instances)
+            self.assertEqual(recovered['status'], 'failed')
+            self.assertNotIn('PRIVATE PROMPT', (Path(tmp) / 'jobs.jsonl').read_text())
+
     def test_device_only_override_does_not_send_prompt_to_better_ranked_pc(self):
         first = {'key': 'small', 'type': 'llm', 'size_bytes': 1, 'loaded_instances': [{'id': 'a'}]}
         second = {'key': 'large', 'type': 'llm', 'size_bytes': 100, 'loaded_instances': [{'id': 'b'}]}

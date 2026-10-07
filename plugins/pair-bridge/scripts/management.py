@@ -237,6 +237,16 @@ def load_model(c, device_id, model_key, context_length, model_type='llm'):
 
 
 def load_with_auto_unload(c, device_id, model_key, context_length, model_type, device_config):
+    """Preserve confirmed releases on every failed load retry path."""
+    unloaded = []
+    try:
+        return _load_with_auto_unload(c, device_id, model_key, context_length, model_type, device_config, unloaded)
+    except ValueError as exc:
+        exc.auto_unloaded_instances = list(unloaded)
+        raise
+
+
+def _load_with_auto_unload(c, device_id, model_key, context_length, model_type, device_config, unloaded):
     """Retry a load only after a confirmed capacity failure and exact configured unloads."""
     try:
         return {'result': load_model(c, device_id, model_key, context_length, model_type),
@@ -249,7 +259,6 @@ def load_with_auto_unload(c, device_id, model_key, context_length, model_type, d
     allowed = device_config.get('auto_unload_models', [])
     if not allowed:
         raise last_error
-    unloaded = []
     for allowed_key in allowed:
         if allowed_key == model_key:
             continue

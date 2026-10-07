@@ -519,9 +519,13 @@ def pair_load(device: str, model: str,
                 c, device, model, context_length, selected.get('type'), device_config)
             load_result = load_attempt['result']
         except ValueError as exc:
-            details = management.describe_unloaded_instances(prepared['auto_unloaded_instances'])
+            released = [*prepared['auto_unloaded_instances'], *getattr(exc, 'auto_unloaded_instances', [])]
+            exc.auto_unloaded_instances = released
+            details = management.describe_unloaded_instances(released)
             if details:
-                raise ValueError(f'{exc}; configured auto_unload_models released: {details}') from exc
+                error = ValueError(f'{exc}; configured auto_unload_models released: {details}')
+                error.auto_unloaded_instances = released
+                raise error from exc
             raise
         auto_unloaded = [*prepared['auto_unloaded_instances'], *load_attempt['auto_unloaded_instances']]
         diagnostics.stage('verification')
@@ -648,9 +652,13 @@ def pair_smart_ask(
                 device_config = management.devices()[selected_device]
                 configured_cap = device_config.get('max_loaded_bytes')
                 cap = min(configured_cap, max_load_bytes) if configured_cap and max_load_bytes else (configured_cap or max_load_bytes)
-                prepared = management.preflight_for_load(
-                    c, selected_device, key, context_length, device_config, cap,
-                    telemetry.sample(device_config), lambda: telemetry.sample(device_config))
+                try:
+                    prepared = management.preflight_for_load(
+                        c, selected_device, key, context_length, device_config, cap,
+                        telemetry.sample(device_config), lambda: telemetry.sample(device_config))
+                except ValueError as exc:
+                    exc.auto_unloaded_instances = [*preselected_unloaded, *getattr(exc, 'auto_unloaded_instances', [])]
+                    raise
                 memory = prepared['memory']
                 candidate = prepared['candidate']
                 preselected_unloaded = [*preselected_unloaded, *prepared['auto_unloaded_instances']]
@@ -666,9 +674,13 @@ def pair_smart_ask(
                             c, selected_device, key, context_length, candidate.get('type'), device_config)
                         load_result = load_attempt['result']
                     except ValueError as exc:
+                        preselected_unloaded.extend(getattr(exc, 'auto_unloaded_instances', []))
+                        exc.auto_unloaded_instances = preselected_unloaded
                         details = management.describe_unloaded_instances(preselected_unloaded)
                         if details:
-                            raise ValueError(f'{exc}; configured auto_unload_models released: {details}') from exc
+                            error = ValueError(f'{exc}; configured auto_unload_models released: {details}')
+                            error.auto_unloaded_instances = preselected_unloaded
+                            raise error from exc
                         raise
                     preselected_unloaded = [*preselected_unloaded, *load_attempt['auto_unloaded_instances']]
                     load_time_seconds = load_result.get('load_time_seconds')
@@ -697,7 +709,9 @@ def pair_smart_ask(
                 # A timeout may leave inference running. Retain the instance for inspection.
                 details = management.describe_unloaded_instances(preselected_unloaded)
                 if details:
-                    raise ValueError(f'{exc}; configured auto_unload_models released: {details}') from exc
+                    error = ValueError(f'{exc}; configured auto_unload_models released: {details}')
+                    error.auto_unloaded_instances = preselected_unloaded
+                    raise error from exc
                 raise
             else:
                 if owned_id and unload_after:
@@ -946,6 +960,11 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
         job.update(status='cancelled', stage='cancelled',
                    cleanup='new_instance_preserved_for_inspection' if owned_id else job.cleanup)
     except Exception as exc:
+        released = list(job.auto_unloaded_instances)
+        for row in getattr(exc, 'auto_unloaded_instances', []):
+            if row not in released:
+                released.append(row)
+        job.update(auto_unloaded_instances=released)
         if job.cancel_event.is_set():
             job.update(status='cancelled', stage='cancelled',
                        cleanup='new_instance_preserved_for_inspection' if owned_id and job.cleanup != 'unloaded_before_inference' else job.cleanup)

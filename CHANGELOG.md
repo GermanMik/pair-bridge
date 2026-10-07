@@ -9,7 +9,8 @@
 - Detect deferred Unsloth load errors and classify in-band out-of-memory failures before applying the configured unload allowlist.
 - Report confirmed allowlisted unloads cumulatively across rejected smart-selection candidates, with device provenance.
 - Recognize Unsloth's native GPU-fit shortage message in deferred successful-HTTP load responses.
-- Validation: 75 tests passed in the release checkout; 77 passed in the local checkout with existing desktop authentication.
+- Preserve confirmed allowlisted unload records when a load retry or job preflight fails, including prompt-free job recovery journals.
+- Validation: 77 tests passed in the release checkout; 79 passed in the local checkout with existing desktop authentication.
 
 ## 0.7.2
 
