@@ -141,6 +141,10 @@ def request(c, method, route, body=None):
         data = r.json()
     except ValueError as exc:
         raise ValueError('Device returned invalid JSON') from exc
+    if isinstance(data, dict) and data.get('_deferred_error'):
+        if method == 'POST' and route == '/api/inference/load' and _response_reports_capacity_error(r):
+            raise ValueError('Device reports insufficient available memory for this model; load was not confirmed')
+        raise ValueError('Device returned a deferred error; operation was not confirmed')
     if not isinstance(data, dict) or 'error' in data:
         raise ValueError('Device returned an error or invalid response')
     return data

@@ -214,9 +214,10 @@ def _validate_smart_candidate(item: dict, context_length: int) -> None:
 
 
 def select_model_for_memory(inventory: list[dict], context_length: int, task_hint: str,
-                            max_load_bytes: int | None = None) -> tuple[str, dict, dict, list[dict]]:
+                            max_load_bytes: int | None = None,
+                            device: str | None = None) -> tuple[str, dict, dict, list[dict]]:
     """Choose the highest-ranked model that passes preflight, then try configured evictions."""
-    ranked = rank_models(inventory, context_length=context_length, task_hint=task_hint,
+    ranked = rank_models(inventory, device=device, context_length=context_length, task_hint=task_hint,
                          max_load_bytes=max_load_bytes)
     errors = []
     configs = management.devices()
@@ -602,7 +603,7 @@ def pair_smart_ask(
     memory_rejections = []
     if model is None:
         selected_device, selected, _selection_memory, preselected_unloaded, memory_rejections = select_model_for_memory(
-            snapshot['devices'], context_length, task_hint, max_load_bytes)
+            snapshot['devices'], context_length, task_hint, max_load_bytes, device=device)
     else:
         selected_device, selected = select_model(snapshot['devices'], model, device, context_length,
                                                  task_hint, max_load_bytes)

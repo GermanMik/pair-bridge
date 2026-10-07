@@ -192,6 +192,29 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(unloaded, [])
         self.assertEqual(len(rejected), 1)
 
+    def test_device_only_override_does_not_send_prompt_to_better_ranked_pc(self):
+        first = {'key': 'small', 'type': 'llm', 'size_bytes': 1, 'loaded_instances': [{'id': 'a'}]}
+        second = {'key': 'large', 'type': 'llm', 'size_bytes': 100, 'loaded_instances': [{'id': 'b'}]}
+        snapshot = {'devices': [{'device': 'pc_a', 'online': True, 'models': [first]},
+                                {'device': 'pc_b', 'online': True, 'models': [second]}]}
+        with patch.object(server, 'catalog', return_value=[]), \
+             patch.object(server, 'pair_devices', return_value=snapshot), \
+             patch.object(server.management, 'devices', return_value={'pc_a': {}, 'pc_b': {}}), \
+             patch.object(server.management, 'client') as client, \
+             patch.object(server.management, 'find_model', return_value=second), \
+             patch.object(server.management, 'request', return_value={
+                 'model': 'large', 'choices': [{'message': {'content': 'answer'}, 'finish_reason': 'stop'}]}):
+            result = server.pair_smart_ask('private task for B', device='pc_b')
+        self.assertEqual(result['device'], 'pc_b')
+        client.assert_called_once_with('pc_b')
+
+    def test_device_only_override_fails_closed_when_target_is_offline(self):
+        inventory = [{'device': 'pc_a', 'online': True, 'models': [
+            {'key': 'warm', 'type': 'llm', 'loaded_instances': [{'id': 'a'}]}]},
+                     {'device': 'pc_b', 'online': False, 'models': []}]
+        with self.assertRaisesRegex(ValueError, 'No suitable installed'):
+            server.select_model_for_memory(inventory, 8192, 'general', device='pc_b')
+
     def test_smart_ask_preserves_existing_instance(self):
         row = {'key': 'warm', 'type': 'llm', 'loaded_instances': [{'id': 'warm-i'}]}
         snapshot = {'devices': [{'device': 'mac', 'online': True, 'models': [row]}]}

@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
+import httpx
 import contextlib
 import json
 import subprocess
@@ -64,6 +65,16 @@ class ManagementTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'insufficient available memory') as error:
             management.request(Client(), 'POST', '/api/inference/load', {'model_path': 'model'})
         self.assertNotIn('private model path', str(error.exception))
+
+    def test_unsloth_success_response_with_deferred_error_is_not_success(self):
+        for detail, expected in [('CUDA out of memory; private model path', 'insufficient available memory'),
+                                 ('bad model; private model path', 'deferred error')]:
+            client = Mock()
+            client.request.return_value = httpx.Response(200, json={'_deferred_error': detail})
+            with self.assertRaisesRegex(ValueError, expected) as error:
+                management.request(client, 'POST', '/api/inference/load', {'model_path': 'model'})
+            self.assertNotIn('private model path', str(error.exception))
+            client.request.assert_called_once()
 
     def test_unsloth_estimate_uses_device_api_and_maps_complete_result(self):
         with patch.object(management, 'devices', return_value={'local': {'engine': 'unsloth'}}), \

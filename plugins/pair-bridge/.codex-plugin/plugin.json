@@ -1,6 +1,6 @@
 {
   "name": "pair-bridge",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "Consult and manage local models through PAIR, including concurrent jobs across configured PCs for compatible MCP clients.",
   "author": {
     "name": "GermanMik"

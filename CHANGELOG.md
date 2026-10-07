@@ -1,10 +1,12 @@
 # Changelog
 
-## 0.7.3
+## 0.7.4
 
 - Advertise cross-PC concurrency through `pair_capabilities` and MCP initialization instructions.
 - Allow background jobs on distinct configured PCs to run concurrently while preserving per-device serialization.
 - Document the start-all-before-poll workflow for compatible MCP clients in English and Russian.
+- Preserve `pair_smart_ask(device=...)` when selecting a model through memory preflight.
+- Detect deferred Unsloth load errors and classify in-band out-of-memory failures before applying the configured unload allowlist.
 
 ## 0.7.2
 
