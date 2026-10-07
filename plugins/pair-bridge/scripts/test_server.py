@@ -235,6 +235,66 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(recovered['status'], 'failed')
             self.assertNotIn('PRIVATE PROMPT', (Path(tmp) / 'jobs.jsonl').read_text())
 
+    def test_unsloth_smart_reuse_preserves_foreign_instance_and_qualifies_all_releases(self):
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        warm = dict(cold, loaded_instances=[{'id': 'foreign-i'}])
+        prior = [{'device': 'pc_a', 'model': 'same', 'instance_id': 'same-i'}]
+        local = [{'model': 'same', 'instance_id': 'same-i'}]
+        for status in ['already_loaded', None]:
+            with self.subTest(status=status), \
+                 patch.object(server, 'catalog', return_value=[]), \
+                 patch.object(server, 'pair_devices', return_value={'devices': []}), \
+                 patch.object(server, 'select_model_for_memory', return_value=('pc_b', cold, {}, prior, [])), \
+                 patch.object(server.management, 'client'), \
+                 patch.object(server.management, 'devices', return_value={'pc_b': {}}), \
+                 patch.object(server.management, 'engine_for', return_value='unsloth'), \
+                 patch.object(server.management, 'find_model', side_effect=[cold, warm]), \
+                 patch.object(server.management, 'models', return_value=[cold]), \
+                 patch.object(server.management, 'preflight_for_load', return_value={'candidate': cold, 'memory': {}, 'auto_unloaded_instances': local}), \
+                 patch.object(server.management, 'load_with_auto_unload', return_value={'result': {'status': status}, 'auto_unloaded_instances': local}), \
+                 patch.object(server.management, 'request', return_value={'choices': [{'message': {'content': 'answer'}}]}) as request, \
+                 patch.object(server.management, 'unload_model') as unload:
+                if status is None:
+                    with self.assertRaisesRegex(ValueError, 'status is not confirmed'):
+                        server.pair_smart_ask('PRIVATE PROMPT')
+                    request.assert_not_called()
+                else:
+                    result = server.pair_smart_ask('PRIVATE PROMPT')
+                    self.assertFalse(result['loaded_for_request'])
+                    self.assertEqual(result['cleanup'], 'existing_instance_preserved')
+                    self.assertEqual({row['device'] for row in result['auto_unloaded_instances']}, {'pc_a', 'pc_b'})
+                unload.assert_not_called()
+
+    def test_unsloth_job_reuse_never_owns_or_unloads_foreign_instance(self):
+        import jobs
+        from unittest.mock import Mock, AsyncMock
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        warm = dict(cold, loaded_instances=[{'id': 'foreign-i'}])
+        for status in ['already_loaded', None]:
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as tmp, \
+                 patch.object(jobs, 'journal_path', return_value=Path(tmp) / 'jobs.jsonl'), \
+                 patch.object(server.management, 'client') as client, \
+                 patch.object(server.management, 'devices', return_value={'pc': {}}), \
+                 patch.object(server.management, 'engine_for', return_value='unsloth'), \
+                 patch.object(server.management, 'models', return_value=[cold]), \
+                 patch.object(server.management, 'preflight_for_load', return_value={'candidate': cold, 'auto_unloaded_instances': []}), \
+                 patch.object(server.management, 'load_with_auto_unload', return_value={'result': {'status': status}, 'auto_unloaded_instances': []}), \
+                 patch.object(server.management, 'find_model', return_value=warm), \
+                 patch.object(server, '_job_stream', new_callable=AsyncMock) as stream, \
+                 patch.object(server.management, 'unload_model') as unload:
+                client.return_value.__enter__.return_value = Mock(base_url='http://unsloth', headers={})
+                job = jobs.Job('pc', 'candidate')
+                server._run_job(job, 'PRIVATE PROMPT', 8192, 2048, True)
+                self.assertFalse(job.owned)
+                unload.assert_not_called()
+                if status is None:
+                    self.assertEqual(job.status, 'failed')
+                    stream.assert_not_called()
+                else:
+                    self.assertEqual(job.status, 'completed')
+                    self.assertEqual(job.cleanup, 'existing_instance_preserved')
+                    stream.assert_awaited_once()
+
     def test_pair_load_verification_failure_reports_confirmed_releases(self):
         cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
         records = [{'model': 'allowed', 'instance_id': 'old-i'}]
@@ -488,6 +548,27 @@ class ConfigTests(unittest.TestCase):
 
 
 class ProtocolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mcp_selected_device_preflight_failure_preserves_both_device_labels(self):
+        from mcp import types
+        cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
+        failure = ValueError('Estimator unavailable')
+        failure.auto_unloaded_instances = [{'model': 'same', 'instance_id': 'same-i'}]
+        with patch.object(server, 'catalog', return_value=[]), \
+             patch.object(server, 'pair_devices', return_value={'devices': []}), \
+             patch.object(server, 'select_model_for_memory', return_value=('pc_b', cold, {}, [{'device': 'pc_a', 'model': 'same', 'instance_id': 'same-i'}], [])), \
+             patch.object(server.management, 'devices', return_value={'pc_b': {}}), \
+             patch.object(server.management, 'client'), \
+             patch.object(server.management, 'find_model', return_value=cold), \
+             patch.object(server.management, 'models', return_value=[cold]), \
+             patch.object(server.management, 'preflight_for_load', side_effect=failure):
+            request = types.CallToolRequest(method='tools/call', params=types.CallToolRequestParams(name='pair_smart_ask', arguments={'prompt': 'PRIVATE PROMPT'}))
+            response = await server.mcp._mcp_server.request_handlers[types.CallToolRequest](request)
+        wire = response.model_dump_json()
+        self.assertTrue(response.root.isError)
+        self.assertIn('pc_a/same [same-i]', wire)
+        self.assertIn('pc_b/same [same-i]', wire)
+        self.assertNotIn('PRIVATE PROMPT', wire)
+
     async def test_mcp_failed_selection_disambiguates_same_instance_across_devices(self):
         from mcp import types
         candidate = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}

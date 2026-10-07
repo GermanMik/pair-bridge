@@ -530,12 +530,13 @@ def pair_load(device: str, model: str,
                     raise error from exc
                 raise
             auto_unloaded = [*prepared['auto_unloaded_instances'], *load_attempt['auto_unloaded_instances']]
+            newly_loaded = management.load_creates_owned_instance(device, load_result)
             diagnostics.stage('verification')
             after = management.find_model(c, model, device)
             after_rows = management.models(c, device)
             before_ids = {i['id'] for m in before_rows for i in m['loaded_instances']}
             after_ids = {i['id'] for m in after_rows for i in m['loaded_instances']}
-            return {'device': device, 'status': 'loaded' if after['loaded_instances'] else 'not_confirmed',
+            return {'device': device, 'status': ('loaded' if newly_loaded else 'already_loaded') if after['loaded_instances'] else 'not_confirmed',
                     'model': after, 'load_time_seconds': load_result.get('load_time_seconds'),
                     'engine_evicted_instances': sorted(before_ids - after_ids -
                                                        {row['instance_id'] for row in auto_unloaded}),
@@ -660,7 +661,7 @@ def pair_smart_ask(
                             c, selected_device, key, context_length, device_config, cap,
                             telemetry.sample(device_config), lambda: telemetry.sample(device_config))
                     except ValueError as exc:
-                        exc.auto_unloaded_instances = [*preselected_unloaded, *getattr(exc, 'auto_unloaded_instances', [])]
+                        exc.auto_unloaded_instances = [*preselected_unloaded, *management.device_releases(getattr(exc, 'auto_unloaded_instances', []), selected_device)]
                         if exc.auto_unloaded_instances:
                             error = ValueError(f'{exc}; confirmed configured releases: '
                                                f'{management.describe_unloaded_instances(exc.auto_unloaded_instances)}')
@@ -669,7 +670,7 @@ def pair_smart_ask(
                         raise
                     memory = prepared['memory']
                     candidate = prepared['candidate']
-                    preselected_unloaded = [*preselected_unloaded, *prepared['auto_unloaded_instances']]
+                    preselected_unloaded = [*preselected_unloaded, *management.device_releases(prepared['auto_unloaded_instances'], selected_device)]
                     diagnostics.stage('load')
                     before_ids = {i['id'] for m in before_rows for i in m['loaded_instances']}
                     if candidate['loaded_instances']:
@@ -682,7 +683,7 @@ def pair_smart_ask(
                                 c, selected_device, key, context_length, candidate.get('type'), device_config)
                             load_result = load_attempt['result']
                         except ValueError as exc:
-                            preselected_unloaded.extend(getattr(exc, 'auto_unloaded_instances', []))
+                            preselected_unloaded.extend(management.device_releases(getattr(exc, 'auto_unloaded_instances', []), selected_device))
                             exc.auto_unloaded_instances = preselected_unloaded
                             details = management.describe_unloaded_instances(preselected_unloaded)
                             if details:
@@ -690,7 +691,7 @@ def pair_smart_ask(
                                 error.auto_unloaded_instances = preselected_unloaded
                                 raise error from exc
                             raise
-                        preselected_unloaded = [*preselected_unloaded, *load_attempt['auto_unloaded_instances']]
+                        preselected_unloaded = [*preselected_unloaded, *management.device_releases(load_attempt['auto_unloaded_instances'], selected_device)]
                         load_time_seconds = load_result.get('load_time_seconds')
                         after = management.find_model(c, key, selected_device)
                         if len(after['loaded_instances']) != 1:
@@ -700,7 +701,8 @@ def pair_smart_ask(
                             response_id = load_result.get('instance_id')
                             if not isinstance(response_id, str) or response_id != loaded_id:
                                 raise ValueError('Load state is not confirmed; inspect pair_list before retrying')
-                        owned_id = loaded_id
+                        if management.load_creates_owned_instance(selected_device, load_result):
+                            owned_id = loaded_id
                         instances = after['loaded_instances']
                         after_ids = {i['id'] for m in management.models(c, selected_device) for i in m['loaded_instances']}
                         intentional = {row['instance_id'] for row in preselected_unloaded}
@@ -928,8 +930,9 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
                         response_id = load_attempt['result'].get('instance_id')
                         if not isinstance(response_id, str) or not response_id or response_id != instance_id:
                             raise ValueError('Load state is not confirmed; inspect pair_list before retrying')
-                    owned_id = instance_id
-                    job.update(instance_id=instance_id, owned=True)
+                    if management.load_creates_owned_instance(job.device, load_attempt['result']):
+                        owned_id = instance_id
+                        job.update(instance_id=instance_id, owned=True)
             job.update(instance_id=instance_id)
             if job.cancel_event.is_set():
                 if owned_id:

@@ -14,7 +14,9 @@
 - Include confirmed releases in MCP-visible errors throughout synchronous preflight, load and verification failures.
 - Recognize native Unsloth free-GPU-memory shortage guards during training and native audio placement, preserving noncapacity refusals.
 - Include device provenance in confirmed-release error text so identical IDs on different PCs remain distinguishable.
-- Validation: 83 tests passed in the release checkout; 85 passed in the local checkout with existing desktop authentication.
+- Preserve external Unsloth instances reused by already_loaded responses; reject unconfirmed load statuses before ownership.
+- Attribute every smart-ask postselection release to its exact selected device before merging records across PCs.
+- Validation: 86 tests passed in the release checkout; 88 passed in the local checkout with existing desktop authentication.
 
 ## 0.7.2
 

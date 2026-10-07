@@ -457,6 +457,21 @@ def describe_unloaded_instances(instances):
                      f"{row['model']} [{row['instance_id']}]" for row in instances)
 
 
+def device_releases(instances, device):
+    """Attribute local mutation records before mixing different PCs."""
+    return [dict(row, device=device) for row in instances]
+
+
+def load_creates_owned_instance(device, result):
+    """Unsloth can reuse an external client's load; only loaded confirms our creation."""
+    if engine_for(device) != 'unsloth':
+        return True
+    status = result.get('status')
+    if status not in ('loaded', 'already_loaded'):
+        raise ValueError('Unsloth load status is not confirmed; inspect pair_list before retrying')
+    return status == 'loaded'
+
+
 def preflight_for_load(c, device_id, model_key, context_length, device_config,
                        max_loaded_bytes=None, capacity=None, capacity_sampler=None):
     """Preserve confirmed unload records even if a later preflight step fails."""
