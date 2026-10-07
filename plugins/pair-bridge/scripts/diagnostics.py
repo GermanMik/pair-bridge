@@ -112,7 +112,8 @@ def recent_with_status(limit: int = 20) -> tuple[list[dict], str]:
             row = json.loads(line)
         except ValueError:
             continue  # A partial last write must not hide earlier diagnostics.
-        if isinstance(row, dict) and row.get('operation') in ('pair_ask', 'pair_smart_ask', 'pair_load', 'pair_unload'):
+        if isinstance(row, dict) and row.get('operation') in ('pair_ask', 'pair_smart_ask', 'pair_load', 'pair_unload',
+                                                           'pair_embeddings', 'pair_vision_ask'):
             rows.append(row)
     latest = {}
     for row in rows:

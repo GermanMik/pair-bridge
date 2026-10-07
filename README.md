@@ -317,7 +317,7 @@ Oh My Pi users can use the same MCP server and a native `/pair` command. See the
 - Likely embedding and draft models are rejected for chat. Type hints are inferred from names.
 - Load, unload, and inference operations are queued per configured device across this user's bridge processes. Router calls use a separate lock because the destination is unknown. Other applications are outside these limits.
 - No automatic retries, fallback models, or downloads during a model request. The engine may load an already installed model and consume GPU/RAM.
-- Default output budget: 2,048 tokens; allowed range: 32–8,192. Input: up to 48,000 characters. Model context limits still apply.
+- Default output budget: 2,048 tokens; minimum: 32. There is no fixed 8,192 maximum. Fresh model output limits and actual loaded context bound `max_tokens`; a cold load also uses its requested context. Unknown limits are delegated to the engine. The engine accounts for prompt and reasoning tokens; a known ceiling is not a guarantee of remaining context. Input: up to 48,000 characters.
 - Request timeout: 180 seconds. Cancellation or timeout does not guarantee cancellation of the upstream model job.
 - Empty final answers are errors. Answers stopped by the output budget are marked as truncated.
 - Unloading affects the exact configured model instance and can disrupt another application that uses it. The skill tracks task-owned loads and avoids unloading unrelated instances.
@@ -373,3 +373,20 @@ codex plugin marketplace remove pair-bridge
 ---
 
 [Report an issue](https://github.com/GermanMik/pair-bridge/issues) · [Privacy](PRIVACY.md) · [Security](SECURITY.md) · [MIT license](LICENSE)
+
+## Model capabilities, structured output, batches, embeddings and vision
+
+| Tool | Purpose |
+| --- | --- |
+| `pair_model_capabilities(device, model)` | Fresh model metadata, individual supported/unsupported/unknown capabilities, source, check time and actual context. No loading or inference probe. |
+| `pair_job_list(device?, include_terminal?, limit?)` | Process-local job metadata, waits and queued/running device jobs; no prompts or answers. Other processes and synchronous calls are not visible; FIFO is not guaranteed. |
+| `pair_batch_start(requests)` | Validate and atomically admit 1–8 individual device/model prompts before starting any worker. |
+| `pair_batch_status(batch_id)` / `pair_batch_cancel(batch_id)` | Independent group outcomes and cancellation requests; terminal results are preserved. |
+| `pair_embeddings(device, model, input, expected_dimensions?)` | Validated float vectors for an exact already-loaded embedding instance. Complete indexes, finite values and consistent dimensions required. |
+| `pair_vision_ask(device, model, prompt, images, ...)` | Multimodal query to a loaded chat instance with fresh explicit vision support; bounded inline PNG/JPEG/WebP data URLs only. |
+
+`pair_ask`, `pair_smart_ask`, `pair_job_start`, each batch member and `pair_vision_ask` accept optional `json_schema` or `response_format`. Schemas are checked before mutations, and output is checked locally; success adds `structured_output`. Invalid JSON, schema mismatches and truncated answers fail without automatic retries. Draft 2020-12 schemas are limited to 32 KiB and 24 nesting levels; references must be inlined. Unknown JSON Schema model support allows an explicit attempt, while explicit unsupported metadata rejects it.
+
+Embeddings accept 1–32 nonblank texts, <=8192 characters each and <=48000 total. `expected_dimensions` checks rather than resizes vectors. Vision accepts 1–4 inline images, <=4 MiB decoded each and <=12 MiB total; it checks base64 and headers/containers, leaving pixel decoding to the engine. Files and remote image URLs are not read. Both tools require a loaded instance; use `pair_load` explicitly when needed.
+
+Batch IDs belong to this process; up to 64 groups and 512 jobs are retained. Old jobs may fall back to journal metadata without answers. Prompts, answers, schemas, images and vectors are not journalled. Existing ownership, device locks and benchmarks are preserved; benchmark expansion is deferred. [Full contracts, examples and limitations](docs/MCP_INFERENCE.md).

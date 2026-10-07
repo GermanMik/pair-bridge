@@ -12,6 +12,7 @@ resolution-markers = [
 requirements = [
     { name = "filelock", specifier = ">=3.18,<4" },
     { name = "httpx", specifier = "==0.28.1" },
+    { name = "jsonschema", specifier = "==4.26.0" },
     { name = "mcp", specifier = "==1.29.1" },
     { name = "platformdirs", specifier = ">=4,<5" },
 ]

@@ -196,10 +196,29 @@ def models(c, device_id=None):
                         'context_length': row['context_length']
                     } if isinstance(row.get('context_length'), int) and not isinstance(row.get('context_length'), bool) else {}}]
                                          if row['loaded'] else [])}
+            if row.get('type') in ('llm', 'embedding'):
+                item['type'] = row['type']
+                item['type_source'] = 'engine_metadata'
+            else:
+                item['type_source'] = 'name_hint'
+                task = row.get('task')
+                task = re.sub(r'[_\s]+', '-', task.lower()) if isinstance(task, str) else ''
+                metadata_type = ('llm' if task in ('text-generation', 'text-generation-inference', 'conversational', 'chat', 'llm',
+                                                 'image-text-to-text', 'visual-question-answering') else
+                                 'embedding' if task in ('embedding', 'embeddings', 'feature-extraction', 'sentence-similarity') else None)
+                if metadata_type is not None:
+                    item['type'] = metadata_type
+                    item['metadata_type'] = metadata_type
+                    item['type_source'] = 'engine_metadata'
+            if isinstance(row.get('capabilities'), dict):
+                item['capabilities'] = {k: v for k, v in row['capabilities'].items()
+                                        if k in ('vision', 'trained_for_tool_use', 'json_schema') and isinstance(v, bool)}
             if isinstance(row.get('display_name'), str):
                 item['display_name'] = row['display_name']
             if isinstance(row.get('max_context_length'), int) and not isinstance(row.get('max_context_length'), bool):
                 item['max_context_length'] = row['max_context_length']
+            if isinstance(row.get('max_output_tokens'), int) and not isinstance(row.get('max_output_tokens'), bool):
+                item['max_output_tokens'] = row['max_output_tokens']
             if isinstance(row.get('size_bytes'), int) and not isinstance(row.get('size_bytes'), bool):
                 item['size_bytes'] = row['size_bytes']
             out.append(item)
@@ -214,7 +233,11 @@ def models(c, device_id=None):
         instances = row['loaded_instances']
         if any(not isinstance(x, dict) or not isinstance(x.get('id'), str) for x in instances):
             raise ValueError('Invalid loaded instance inventory')
-        out.append({k: row[k] for k in ('key', 'display_name', 'type', 'size_bytes', 'max_context_length', 'loaded_instances') if k in row})
+        item = {k: row[k] for k in ('key', 'display_name', 'type', 'size_bytes', 'max_context_length', 'max_output_tokens', 'loaded_instances') if k in row}
+        if isinstance(row.get('capabilities'), dict):
+            item['capabilities'] = {k: v for k, v in row['capabilities'].items()
+                                    if k in ('vision', 'trained_for_tool_use', 'json_schema') and isinstance(v, bool)}
+        out.append(item)
     return out
 
 

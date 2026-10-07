@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11,<3.15"
-# dependencies = ["mcp==1.29.1", "httpx==0.28.1", "filelock>=3.18,<4", "platformdirs>=4,<5"]
+# dependencies = ["mcp==1.29.1", "httpx==0.28.1", "filelock>=3.18,<4", "platformdirs>=4,<5", "jsonschema==4.26.0"]
 # ///
 """Codex MCP tools for the local NVIDIA PAIR OpenAI-compatible proxy."""
 from __future__ import annotations
@@ -12,6 +12,7 @@ import management
 import telemetry
 import benchmarks
 import jobs
+import inference_io
 import download_review
 import jev
 import diagnostics
@@ -30,7 +31,7 @@ from typing import Annotated
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import Field
+from pydantic import Field, BaseModel, ConfigDict
 
 def load_config() -> tuple[str, str | None]:
     path = Path.home() / '.pair-bridge.json'
@@ -100,7 +101,7 @@ def catalog() -> list[dict]:
             name = item['id']
             # PAIR /v1/models omits model type. Mark conservative hints as such.
             hint = 'embedding' if 'embed' in name.lower() else ('draft' if any(x in name.lower() for x in ('dflash', 'draft')) else 'chat_candidate')
-            result.append({'id': name, 'kind_hint': hint})
+            result.append(dict({'id': name, 'kind_hint': hint}, **{k: item[k] for k in ('max_context_length', 'max_output_tokens') if k in item}))
     return result
 
 
@@ -197,7 +198,8 @@ def select_model(inventory: list[dict], model: str | None = None, device: str | 
     return rank_models(inventory, model, device, context_length, task_hint, max_load_bytes)[0]
 
 
-def _validate_smart_candidate(item: dict, context_length: int) -> None:
+def _validate_smart_candidate(item: dict, context_length: int, max_tokens: int | None = None) -> None:
+    inference_io.output_budget(item, max_tokens, context_length)
     if item.get('type') != 'llm':
         raise ValueError('Candidate is no longer a chat LLM')
     limit = item.get('max_context_length')
@@ -215,7 +217,7 @@ def _validate_smart_candidate(item: dict, context_length: int) -> None:
 
 def select_model_for_memory(inventory: list[dict], context_length: int, task_hint: str,
                             max_load_bytes: int | None = None,
-                            device: str | None = None) -> tuple[str, dict, dict, list[dict]]:
+                            device: str | None = None, max_tokens: int | None = None) -> tuple[str, dict, dict, list[dict]]:
     """Choose the highest-ranked model that passes preflight, then try configured evictions."""
     ranked = rank_models(inventory, device=device, context_length=context_length, task_hint=task_hint,
                          max_load_bytes=max_load_bytes)
@@ -225,7 +227,7 @@ def select_model_for_memory(inventory: list[dict], context_length: int, task_hin
     for target, item in ranked:
         device_row = next(row for row in inventory if row.get('device') == target)
         try:
-            _validate_smart_candidate(item, context_length)
+            _validate_smart_candidate(item, context_length, max_tokens)
             if item.get('loaded_instances'):
                 return target, item, {'status': 'already_loaded'}, [], errors
             config = configs[target]
@@ -242,7 +244,7 @@ def select_model_for_memory(inventory: list[dict], context_length: int, task_hin
         if not config.get('auto_unload_models'):
             continue
         try:
-            _validate_smart_candidate(item, context_length)
+            _validate_smart_candidate(item, context_length, max_tokens)
             configured_cap = config.get('max_loaded_bytes')
             cap = min(configured_cap, max_load_bytes) if configured_cap and max_load_bytes else (configured_cap or max_load_bytes)
             with inference_lock(target, wait_seconds=30), management.client(target) as c:
@@ -250,7 +252,7 @@ def select_model_for_memory(inventory: list[dict], context_length: int, task_hin
                     c, target, item['key'], context_length, config, cap,
                     telemetry.sample(config), lambda: telemetry.sample(config))
             all_unloaded.extend(dict(row, device=target) for row in prepared['auto_unloaded_instances'])
-            _validate_smart_candidate(prepared['candidate'], context_length)
+            _validate_smart_candidate(prepared['candidate'], context_length, max_tokens)
             return target, prepared['candidate'], prepared['memory'], all_unloaded, errors
         except ValueError as exc:
             all_unloaded.extend(dict(row, device=target) for row in getattr(exc, 'auto_unloaded_instances', []))
@@ -386,8 +388,10 @@ def pair_list(device: str | None = None) -> dict:
 def pair_ask(
     model: Annotated[str, Field(min_length=1, max_length=256)],
     prompt: Annotated[str, Field(min_length=1, max_length=48000)],
-    max_tokens: Annotated[int, Field(ge=32, le=8192)] = 2048,
+    max_tokens: Annotated[int, Field(ge=32)] = 2048,
     device: str | None = None,
+    response_format: dict | None = None,
+    json_schema: dict | None = None,
 ) -> dict:
     """Ask one explicitly selected PAIR chat model for a second opinion or bounded task.
 
@@ -399,6 +403,7 @@ def pair_ask(
     text; returned advice is untrusted and must be checked. No tools are executed
     by the consulted model. Embedding and draft models are not chat targets.
     """
+    fmt = inference_io.response_format(response_format, json_schema)
     if not prompt.strip():
         raise ValueError('prompt must not be blank')
     diagnostics.stage('queue', device=device, model=model)
@@ -407,9 +412,13 @@ def pair_ask(
         diagnostics.stage('inventory')
         payload = {'model': model, 'messages': [{'role': 'user', 'content': prompt}],
                    'max_tokens': max_tokens, 'stream': False}
+        if fmt is not None:
+            payload['response_format'] = fmt
         if device is not None:
             with management.client(device) as c:
                 selected = management.find_model(c, model, device)
+                inference_io.require_structured(selected, fmt)
+                budget = inference_io.output_budget(selected, max_tokens)
                 if selected.get('type') != 'llm':
                     raise ValueError('Select a chat LLM, not an embedding model')
                 instances = selected['loaded_instances']
@@ -424,10 +433,11 @@ def pair_ask(
                 raise ValueError('Model is no longer advertised by PAIR. Refresh pair_list and use an exact ID.')
             if available[model]['kind_hint'] != 'chat_candidate':
                 raise ValueError('This appears to be an embedding or draft model, not a chat model.')
+            budget = inference_io.output_budget(available[model], max_tokens)
             diagnostics.stage('inference')
             data = request('POST', '/chat/completions', payload)
         diagnostics.stage('validation')
-        return completion(data, model, device, start)
+        return dict(inference_io.validate_completion(completion(data, model, device, start), fmt), output_budget=budget)
 
 
 
@@ -440,6 +450,12 @@ def pair_capabilities() -> dict:
     """
     return {
         'cross_device_parallel_jobs': True,
+        'model_capability_discovery': 'pair_model_capabilities',
+        'structured_output': ['pair_ask', 'pair_smart_ask', 'pair_job_start', 'pair_batch_start', 'pair_vision_ask'],
+        'job_listing': 'pair_job_list',
+        'batch_jobs': ['pair_batch_start', 'pair_batch_status', 'pair_batch_cancel'],
+        'embeddings': 'pair_embeddings (explicit already-loaded embedding instance)',
+        'vision': 'pair_vision_ask (confirmed vision metadata, inline images)',
         'configured_devices': list(management.devices()),
         'workflow': ['pair_devices', 'pair_list', 'pair_job_start for each target',
                      'pair_job_status for each job_id'],
@@ -593,16 +609,19 @@ def pair_smart_ask(
     model: str | None = None,
     device: str | None = None,
     context_length: Annotated[int, Field(ge=512, le=262144)] = 8192,
-    max_tokens: Annotated[int, Field(ge=32, le=8192)] = 2048,
+    max_tokens: Annotated[int, Field(ge=32)] = 2048,
     unload_after: bool = True,
     task_hint: Annotated[str, Field(pattern='^(general|code|fast|long_context|analysis)$')] = 'general',
     max_load_bytes: Annotated[int | None, Field(ge=1)] = None,
+    response_format: dict | None = None,
+    json_schema: dict | None = None,
 ) -> dict:
     """Select a memory-fit installed LLM unless one is explicit, load if needed, ask once, and clean up only a new instance.
 
     No model downloads. Automatic selection checks memory before choosing; an explicit model is never substituted.
     Existing loaded instances are preserved. An ambiguous multi-instance model is not selected automatically.
     """
+    fmt = inference_io.response_format(response_format, json_schema)
     if not prompt.strip():
         raise ValueError('prompt must not be blank')
     diagnostics.stage('inventory', device=device, model=model)
@@ -617,7 +636,7 @@ def pair_smart_ask(
     memory_rejections = []
     if model is None:
         selected_device, selected, _selection_memory, preselected_unloaded, memory_rejections = select_model_for_memory(
-            snapshot['devices'], context_length, task_hint, max_load_bytes, device=device)
+            snapshot['devices'], context_length, task_hint, max_load_bytes, device=device, max_tokens=max_tokens)
     else:
         selected_device, selected = select_model(snapshot['devices'], model, device, context_length,
                                                  task_hint, max_load_bytes)
@@ -634,6 +653,8 @@ def pair_smart_ask(
             with management.client(selected_device) as c:
                 # Recheck after selection: another application may have changed the load state.
                 live = management.find_model(c, key, selected_device)
+                inference_io.require_structured(live, fmt)
+                inference_io.output_budget(live, max_tokens, context_length)
                 if live.get('type') != 'llm':
                     raise ValueError('Selected model is no longer a chat LLM; refresh inventory')
                 limit = live.get('max_context_length')
@@ -653,6 +674,7 @@ def pair_smart_ask(
                     candidate = next((m for m in before_rows if m['key'] == key), None)
                     if candidate is None:
                         raise ValueError('Selected model disappeared before load; refresh inventory')
+                    inference_io.output_budget(candidate, max_tokens, context_length)
                     device_config = management.devices()[selected_device]
                     configured_cap = device_config.get('max_loaded_bytes')
                     cap = min(configured_cap, max_load_bytes) if configured_cap and max_load_bytes else (configured_cap or max_load_bytes)
@@ -671,12 +693,14 @@ def pair_smart_ask(
                     memory = prepared['memory']
                     candidate = prepared['candidate']
                     preselected_unloaded = [*preselected_unloaded, *management.device_releases(prepared['auto_unloaded_instances'], selected_device)]
+                    inference_io.output_budget(candidate, max_tokens, context_length)
                     diagnostics.stage('load')
                     before_ids = {i['id'] for m in before_rows for i in m['loaded_instances']}
                     if candidate['loaded_instances']:
                         if len(candidate['loaded_instances']) != 1:
                             raise ValueError('Multiple instances of the selected model became loaded; inspect state')
                         instances = candidate['loaded_instances']
+                        live = candidate
                     else:
                         try:
                             load_attempt = management.load_with_auto_unload(
@@ -694,6 +718,7 @@ def pair_smart_ask(
                         preselected_unloaded = [*preselected_unloaded, *management.device_releases(load_attempt['auto_unloaded_instances'], selected_device)]
                         load_time_seconds = load_result.get('load_time_seconds')
                         after = management.find_model(c, key, selected_device)
+                        live = after
                         if len(after['loaded_instances']) != 1:
                             raise ValueError('Load state is not confirmed; inspect pair_list before retrying')
                         loaded_id = after['loaded_instances'][0]['id']
@@ -707,14 +732,17 @@ def pair_smart_ask(
                         after_ids = {i['id'] for m in management.models(c, selected_device) for i in m['loaded_instances']}
                         intentional = {row['instance_id'] for row in preselected_unloaded}
                         engine_evicted_instances = sorted(before_ids - after_ids - intentional)
+                budget = inference_io.output_budget(dict(live, loaded_instances=instances), max_tokens)
                 payload = {'model': management.chat_model_id(selected_device, key, instances[0]['id']),
                            'messages': [{'role': 'user', 'content': prompt}],
                            'max_tokens': max_tokens, 'stream': False}
+                if fmt is not None:
+                    payload['response_format'] = fmt
                 try:
                     diagnostics.stage('inference')
                     data = management.request(c, 'POST', '/v1/chat/completions', payload)
                     diagnostics.stage('validation')
-                    result = completion(data, key, selected_device, started)
+                    result = inference_io.validate_completion(completion(data, key, selected_device, started), fmt)
                 except Exception as exc:
                     # A timeout may leave inference running. Retain the instance for inspection.
                     details = management.describe_unloaded_instances(preselected_unloaded)
@@ -748,7 +776,7 @@ def pair_smart_ask(
                                             f"median {measured['median_latency_ms']} ms among memory-fit candidates")
                     else:
                         selection_reason = 'highest-ranked installed chat model that passes memory preflight'
-                    return dict(result, selected_model=key, instance_id=instances[0]['id'],
+                    return dict(result, output_budget=budget, selected_model=key, instance_id=instances[0]['id'],
                                 loaded_for_request=bool(owned_id), cleanup=cleanup,
                                 selection_profile=task_hint,
                                 selection_reason=selection_reason,
@@ -760,12 +788,15 @@ def pair_smart_ask(
                                 router_status=router_status, router_advertises_model=key in router_models)
 
 
-async def _job_stream(job: jobs.Job, c: httpx.AsyncClient, instance_id: str, prompt: str, max_tokens: int) -> str:
+async def _job_stream(job: jobs.Job, c: httpx.AsyncClient, instance_id: str, prompt: str, max_tokens: int,
+                      response_format: dict | None = None) -> str:
     """Consume engine SSE; retain message text only, never reasoning/tool content."""
-    if management.engine_for(job.device) == 'unsloth':
+    if management.engine_for(job.device) == 'unsloth' or response_format is not None:
         payload = {'model': management.chat_model_id(job.device, job.model, instance_id),
                    'messages': [{'role': 'user', 'content': prompt}],
                    'max_tokens': max_tokens, 'stream': True}
+        if response_format is not None:
+            payload['response_format'] = response_format
         ended = False
         async with c.stream('POST', '/v1/chat/completions', json=payload) as response:
             if not response.is_success:
@@ -795,6 +826,10 @@ async def _job_stream(job: jobs.Job, c: httpx.AsyncClient, instance_id: str, pro
                 if not isinstance(choices, list) or not choices:
                     continue
                 first = choices[0]
+                if isinstance(first, dict) and first.get('finish_reason') is not None:
+                    reason = first['finish_reason']
+                    job.finish_reason = reason if isinstance(reason, str) and reason in (
+                        'stop', 'length', 'tool_calls', 'content_filter', 'function_call') else 'unknown'
                 delta = first.get('delta') if isinstance(first, dict) else None
                 content = delta.get('content') if isinstance(delta, dict) else None
                 if isinstance(content, str):
@@ -862,7 +897,9 @@ async def _job_stream(job: jobs.Job, c: httpx.AsyncClient, instance_id: str, pro
                             with job.lock:
                                 if not job.cancel_event.is_set():
                                     job.answer = final[:48000]
+                                    job.output_truncated = len(final) > 48000
                     ended = True
+                    job.finish_reason = 'stop'
                 event_type, data_text = None, ''
     if job.cancel_event.is_set():
         raise asyncio.CancelledError()
@@ -873,7 +910,8 @@ async def _job_stream(job: jobs.Job, c: httpx.AsyncClient, instance_id: str, pro
     return job.answer
 
 
-def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, unload_after: bool) -> None:
+def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, unload_after: bool,
+             response_format: dict | None = None) -> None:
     owned_id = None
     try:
         with inference_lock(job.device, wait_seconds=30), management.client(job.device) as c:
@@ -885,6 +923,8 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
             selected = next((m for m in rows if m['key'] == job.model), None)
             if selected is None or selected.get('type') != 'llm':
                 raise ValueError('Model is not an installed chat LLM on this device')
+            inference_io.require_structured(selected, response_format)
+            inference_io.output_budget(selected, max_tokens, context_length)
             maximum = selected.get('max_context_length')
             if isinstance(maximum, int) and context_length > maximum:
                 raise ValueError('Requested context exceeds model maximum')
@@ -904,6 +944,7 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
                     config.get('max_loaded_bytes'), telemetry.sample(config),
                     lambda: telemetry.sample(config))
                 selected = prepared['candidate']
+                inference_io.output_budget(selected, max_tokens, context_length)
                 job.update(auto_unloaded_instances=prepared['auto_unloaded_instances'])
                 instances = selected['loaded_instances']
                 if instances:
@@ -922,7 +963,8 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
                         c, job.device, job.model, context_length, selected.get('type'), config)
                     job.update(auto_unloaded_instances=[*prepared['auto_unloaded_instances'],
                                                        *load_attempt['auto_unloaded_instances']])
-                    confirmed = management.find_model(c, job.model, job.device)['loaded_instances']
+                    selected = management.find_model(c, job.model, job.device)
+                    confirmed = selected['loaded_instances']
                     if len(confirmed) != 1:
                         raise ValueError('Loaded instance could not be confirmed')
                     instance_id = confirmed[0]['id']
@@ -933,7 +975,8 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
                     if management.load_creates_owned_instance(job.device, load_attempt['result']):
                         owned_id = instance_id
                         job.update(instance_id=instance_id, owned=True)
-            job.update(instance_id=instance_id)
+            budget = inference_io.output_budget(selected, max_tokens)
+            job.update(instance_id=instance_id, output_budget=budget)
             if job.cancel_event.is_set():
                 if owned_id:
                     management.unload_model(c, job.device, job.model, owned_id)
@@ -944,6 +987,8 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
             async def stream_request():
                 async with httpx.AsyncClient(base_url=str(c.base_url), headers=c.headers,
                                              timeout=180, trust_env=False, follow_redirects=False) as stream_client:
+                    if response_format is not None:
+                        return await _job_stream(job, stream_client, instance_id, prompt, max_tokens, response_format)
                     return await _job_stream(job, stream_client, instance_id, prompt, max_tokens)
             loop = asyncio.new_event_loop()
             try:
@@ -960,6 +1005,13 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
             if job.cancel_event.is_set():
                 job.update(status='cancelled', stage='cancelled')
                 return
+            if response_format is not None:
+                if job.finish_reason is None:
+                    raise ValueError('Structured stream omitted finish reason')
+                validated = inference_io.validate_completion(
+                    {'answer': job.answer, 'finish_reason': job.finish_reason,
+                     'truncated': job.finish_reason == 'length' or job.output_truncated}, response_format)
+                job.structured_output = validated['structured_output']
             cleanup = 'existing_instance_preserved'
             if owned_id:
                 cleanup = 'new_instance_retained'
@@ -994,8 +1046,9 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 def pair_job_start(device: str, model: str, prompt: Annotated[str, Field(min_length=1, max_length=48000)],
                    context_length: Annotated[int, Field(ge=512, le=262144)] = 8192,
-                   max_tokens: Annotated[int, Field(ge=32, le=8192)] = 2048,
-                   unload_after: bool = True) -> dict:
+                   max_tokens: Annotated[int, Field(ge=32)] = 2048,
+                   unload_after: bool = True, response_format: dict | None = None,
+                   json_schema: dict | None = None) -> dict:
     """Start a background model job; different explicit PCs can run concurrently.
 
     Start every target before polling pair_job_status. Same-device jobs serialize
@@ -1003,8 +1056,11 @@ def pair_job_start(device: str, model: str, prompt: Annotated[str, Field(min_len
     Each call accepts its own prompt/model for an individual task on that PC.
     No download, automatic retry or fallback. Job IDs belong to this MCP process.
     """
+    fmt = inference_io.response_format(response_format, json_schema)
     if device not in management.devices() or not prompt.strip():
         raise ValueError('Use an exact configured device and nonblank prompt')
+    if fmt is not None:
+        return jobs.create(device, model, _run_job, prompt, context_length, max_tokens, unload_after, fmt)
     return jobs.create(device, model, _run_job, prompt, context_length, max_tokens, unload_after)
 
 
@@ -1012,6 +1068,152 @@ def pair_job_start(device: str, model: str, prompt: Annotated[str, Field(min_len
 def pair_job_status(job_id: str) -> dict:
     """Read current progress and final answer; interrupted jobs retain prompt-free recovery metadata."""
     return jobs.get(job_id)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
+def pair_model_capabilities(device: str, model: str) -> dict:
+    """Inspect fresh engine model metadata without loading or probing inference.
+
+    Unknown does not mean unsupported. LM Studio reports vision/tool training;
+    JSON Schema model support is unknown unless explicitly reported by the engine.
+    """
+    with management.client(device) as c:
+        item = management.find_model(c, model, device)
+    return dict(inference_io.model_capabilities(item, management.engine_for(device)), device=device)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
+def pair_job_list(device: str | None = None, include_terminal: bool = False,
+                  limit: Annotated[int, Field(ge=1, le=64)] = 64) -> dict:
+    """List process-local metadata, queue waits and active device jobs; no prompts/answers.
+
+    Queue order is not FIFO-guaranteed. Synchronous calls and other processes are
+    not visible; an empty running list does not prove a physical device is idle.
+    """
+    if device is not None and device not in management.devices():
+        raise ValueError('Use an exact configured device')
+    return jobs.listing(device, include_terminal, limit)
+
+
+class BatchRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    device: Annotated[str, Field(min_length=1, max_length=64)]
+    model: Annotated[str, Field(min_length=1, max_length=256)]
+    prompt: Annotated[str, Field(min_length=1, max_length=48000)]
+    context_length: Annotated[int, Field(ge=512, le=262144)] = 8192
+    max_tokens: Annotated[int, Field(ge=32)] = 2048
+    unload_after: bool = True
+    response_format: dict | None = None
+    json_schema: dict | None = None
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+def pair_batch_start(requests: Annotated[list[BatchRequest], Field(min_length=1, max_length=8)]) -> dict:
+    """Atomically admit 1-8 independent device/model prompts before polling any.
+
+    All inputs and available process capacity are checked before workers start.
+    Inventory/load errors remain independent job outcomes. Same-device jobs retain
+    the 30s lock timeout; use distinct physical PCs for actual parallel inference.
+    """
+    if not isinstance(requests, list) or not 1 <= len(requests) <= 8:
+        raise ValueError('Batch requires 1-8 requests')
+    configs = management.devices()
+    prepared = []
+    for request in requests:
+        # Also validate direct Python use, not only FastMCP's typed call path.
+        try:
+            item = request if isinstance(request, BatchRequest) else BatchRequest.model_validate(request)
+        except ValueError as exc:
+            raise ValueError('Invalid batch request') from exc
+        if item.device not in configs or not item.model.strip() or not item.prompt.strip():
+            raise ValueError('Batch requires configured devices and nonblank model/prompt')
+        row = item.model_dump(exclude={'json_schema'})
+        row['response_format'] = inference_io.response_format(item.response_format, item.json_schema)
+        prepared.append(row)
+    return jobs.create_batch(prepared, _run_job)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
+def pair_batch_status(batch_id: str) -> dict:
+    """Read independent batch results in this MCP process; never retry failed jobs."""
+    return jobs.batch_status(batch_id)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
+def pair_batch_cancel(batch_id: str) -> dict:
+    """Request cancellation for live members; completed results remain unchanged.
+
+    Bridge stream closure does not confirm engine computation has stopped.
+    """
+    return jobs.batch_cancel(batch_id)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@diagnostics.traced
+def pair_embeddings(device: str, model: str, input: str | list[str],
+                    expected_dimensions: Annotated[int | None, Field(ge=1, le=16384)] = None) -> dict:
+    """Embed bounded texts using an exact already-loaded embedding model instance.
+
+    1-32 texts, <=8192 characters each, <=48000 total. expected_dimensions only
+    validates the output; it never requests vector resizing. No load or download.
+    """
+    texts = inference_io.embedding_inputs(input)
+    if expected_dimensions is not None and (not isinstance(expected_dimensions, int) or
+            isinstance(expected_dimensions, bool) or not 1 <= expected_dimensions <= 16384):
+        raise ValueError('Expected dimensions must be 1-16384')
+    diagnostics.stage('queue', device=device, model=model)
+    with inference_lock(device, wait_seconds=30), management.client(device) as c:
+        item = management.find_model(c, model, device)
+        capabilities = inference_io.model_capabilities(item, management.engine_for(device))
+        if capabilities['capabilities']['embeddings']['status'] != 'supported':
+            raise ValueError('Engine metadata does not confirm an embedding model')
+        instances = item['loaded_instances']
+        if len(instances) != 1:
+            raise ValueError('Embeddings require exactly one already-loaded instance; use pair_load first')
+        diagnostics.stage('inference')
+        data = management.request(c, 'POST', '/v1/embeddings',
+                                  {'model': management.chat_model_id(device, model, instances[0]['id']),
+                                   'input': texts, 'encoding_format': 'float'})
+        diagnostics.stage('validation')
+        result = inference_io.embeddings(data, len(texts), expected_dimensions)
+    return dict(result, device=device, requested_model=model, instance_id=instances[0]['id'])
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+@diagnostics.traced
+def pair_vision_ask(device: str, model: str, prompt: Annotated[str, Field(min_length=1, max_length=48000)],
+                    images: Annotated[list[str], Field(min_length=1, max_length=4)],
+                    max_tokens: Annotated[int, Field(ge=32)] = 2048,
+                    response_format: dict | None = None, json_schema: dict | None = None) -> dict:
+    """Ask a confirmed vision model with inline PNG/JPEG/WebP data URLs only.
+
+    Requires one loaded chat instance; no loading, file reads or image URL fetching.
+    Header/container checks and limits: <=4 MiB decoded/image, <=12 MiB total.
+    Unknown/unsupported vision capability is rejected before inference.
+    """
+    content = inference_io.vision_content(prompt, images)
+    fmt = inference_io.response_format(response_format, json_schema)
+    diagnostics.stage('queue', device=device, model=model)
+    with inference_lock(device, wait_seconds=30), management.client(device) as c:
+        item = management.find_model(c, model, device)
+        capabilities = inference_io.model_capabilities(item, management.engine_for(device))
+        if capabilities['capabilities']['chat']['status'] != 'supported' or capabilities['capabilities']['vision']['status'] != 'supported':
+            raise ValueError('Fresh engine metadata does not confirm vision support for this chat model')
+        inference_io.require_structured(item, fmt)
+        budget = inference_io.output_budget(item, max_tokens)
+        instances = item['loaded_instances']
+        if len(instances) != 1:
+            raise ValueError('Vision requires exactly one already-loaded instance; use pair_load first')
+        payload = {'model': management.chat_model_id(device, model, instances[0]['id']),
+                   'messages': [{'role': 'user', 'content': content}], 'max_tokens': max_tokens, 'stream': False}
+        if fmt is not None:
+            payload['response_format'] = fmt
+        started = time.monotonic()
+        diagnostics.stage('inference')
+        data = management.request(c, 'POST', '/v1/chat/completions', payload)
+        diagnostics.stage('validation')
+        result = inference_io.validate_completion(completion(data, model, device, started), fmt)
+    return dict(result, output_budget=budget, instance_id=instances[0]['id'], image_count=len(images))
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
@@ -1039,7 +1241,7 @@ def pair_job_recover(job_id: str) -> dict:
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 def pair_compare(prompt: Annotated[str, Field(min_length=1, max_length=48000)],
                  first_model: str, first_device: str, second_model: str, second_device: str,
-                 max_tokens: Annotated[int, Field(ge=32, le=8192)] = 2048) -> dict:
+                 max_tokens: Annotated[int, Field(ge=32)] = 2048) -> dict:
     """Ask two explicitly named installed models sequentially; preserve both answers for Codex to assess."""
     if first_model == second_model and first_device == second_device:
         raise ValueError('Comparison requires two distinct model/device targets')

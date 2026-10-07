@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.0
+
+- Add fresh per-model capability and context discovery, including explicit `supported`, `unsupported`, and `unknown` states.
+- Add structured JSON output with local schema validation, plus process-local job and queue visibility.
+- Add atomic multi-job batches with independent outcomes, and bounded embeddings and inline-image vision tools for exact already-loaded model instances.
+- Remove the fixed 8192 output-token ceiling. Requests honor fresh model and loaded-instance limits without silent clamping; unknown limits remain delegated to the engine, which accounts for prompt and reasoning tokens.
+- Expand English and Russian guides and plugin instructions for the new tools and output-budget behavior.
+- Defer benchmark expansion; existing benchmark behavior is unchanged.
+- Validation: 116 tests passed in the isolated release checkout.
+
 ## 0.7.4
 
 - Advertise cross-PC concurrency through `pair_capabilities` and MCP initialization instructions.

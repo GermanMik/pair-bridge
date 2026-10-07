@@ -665,7 +665,9 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                                                           'pair_smart_ask', 'pair_compare', 'pair_diagnose',
                                                           'pair_download_plan', 'pair_download', 'pair_download_status',
                                                           'pair_decide', 'pair_score', 'pair_benchmark', 'pair_benchmark_results',
-                                                          'pair_job_start', 'pair_job_status', 'pair_job_cancel', 'pair_job_recover'})
+                                                          'pair_job_start', 'pair_job_status', 'pair_job_cancel', 'pair_job_recover',
+                                                          'pair_model_capabilities', 'pair_job_list', 'pair_batch_start', 'pair_batch_status',
+                                                          'pair_batch_cancel', 'pair_embeddings', 'pair_vision_ask'})
                 capability = next(t for t in tools if t.name == 'pair_capabilities')
                 self.assertTrue(capability.annotations.readOnlyHint)
                 self.assertIn('different explicit PCs can run concurrently', next(t for t in tools if t.name == 'pair_job_start').description)

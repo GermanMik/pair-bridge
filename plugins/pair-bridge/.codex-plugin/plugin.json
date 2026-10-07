@@ -1,14 +1,14 @@
 {
   "name": "pair-bridge",
-  "version": "0.7.4",
-  "description": "Consult and manage local models through PAIR, including concurrent jobs across configured PCs for compatible MCP clients.",
+  "version": "0.8.0",
+  "description": "Use local models through PAIR with structured output, batch jobs, embeddings, vision, and concurrency across configured PCs.",
   "author": {
     "name": "GermanMik"
   },
   "interface": {
     "displayName": "PAIR Bridge",
-    "shortDescription": "Run local model tasks concurrently across PCs.",
-    "longDescription": "Inspect devices, discover concurrency with pair_capabilities, start model jobs on different PCs before polling, and manage exact model instances.",
+    "shortDescription": "Use structured, batch and multimodal local model tools.",
+    "longDescription": "Inspect model capabilities and output budgets, validate structured answers, start process-local batches, and use loaded models for embeddings and vision.",
     "developerName": "GermanMik",
     "category": "Productivity",
     "capabilities": [],
