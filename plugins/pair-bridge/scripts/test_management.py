@@ -68,6 +68,9 @@ class ManagementTests(unittest.TestCase):
 
     def test_unsloth_success_response_with_deferred_error_is_not_success(self):
         for detail, expected in [('CUDA out of memory; private model path', 'insufficient available memory'),
+                                 ('This model needs about 21.5 GB of GPU memory at a 8192 context, '
+                                  'and 3.0 GB is free next to the models already loaded. Unload one of them; private model path',
+                                  'insufficient available memory'),
                                  ('bad model; private model path', 'deferred error')]:
             client = Mock()
             client.request.return_value = httpx.Response(200, json={'_deferred_error': detail})
@@ -182,6 +185,16 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(request.call_args.args[3], {'instance_id': 'permitted-i'})
         self.assertEqual(preflight.call_count, 2)
         self.assertEqual(estimate.call_count, 0)
+
+    def test_failed_preflight_preserves_confirmed_unloads_structurally(self):
+        other = {'key': 'allowed', 'loaded_instances': [{'id': 'old-i'}]}
+        cold = {'key': 'candidate', 'loaded_instances': []}
+        with patch.object(management, 'models', side_effect=[[other, cold], [other, cold], [cold], [cold]]), \
+             patch.object(management, 'memory_preflight', side_effect=ValueError('Insufficient currently available GPU memory')), \
+             patch.object(management, 'unload_model'):
+            with self.assertRaises(ValueError) as failure:
+                management.preflight_for_load(object(), 'pc', 'candidate', 8192, {'auto_unload_models': ['allowed']})
+        self.assertEqual(failure.exception.auto_unloaded_instances, [{'model': 'allowed', 'instance_id': 'old-i'}])
 
     def test_preflight_without_unload_setting_preserves_loaded_model(self):
         other = {'key': 'other', 'loaded_instances': [{'id': 'other-i'}]}

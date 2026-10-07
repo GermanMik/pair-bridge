@@ -192,6 +192,24 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(unloaded, [])
         self.assertEqual(len(rejected), 1)
 
+    def test_selector_reports_unloads_from_failed_candidate_before_later_success(self):
+        candidates = [{'key': key, 'type': 'llm', 'size_bytes': size, 'loaded_instances': []}
+                      for key, size in [('first', 1), ('second', 2)]]
+        inventory = [{'device': 'pc', 'online': True, 'models': candidates}]
+        failure = ValueError('Insufficient currently available GPU memory')
+        failure.auto_unloaded_instances = [{'model': 'allowed', 'instance_id': 'old-i'}]
+        prepared = {'candidate': candidates[1], 'memory': {'status': 'estimated'},
+                    'auto_unloaded_instances': [{'model': 'allowed2', 'instance_id': 'old2-i'}]}
+        with patch.object(server.management, 'devices', return_value={'pc': {'auto_unload_models': ['allowed']}}), \
+             patch.object(server.management, 'memory_preflight', side_effect=ValueError('Insufficient currently available GPU memory')), \
+             patch.object(server.management, 'client'), \
+             patch.object(server.management, 'preflight_for_load', side_effect=[failure, prepared]), \
+             patch.object(server, 'inference_lock'):
+            device, model, memory, unloaded, rejected = server.select_model_for_memory(inventory, 8192, 'general')
+        self.assertEqual(model['key'], 'second')
+        self.assertEqual(unloaded, [{'device': 'pc', 'model': 'allowed', 'instance_id': 'old-i'},
+                                    {'device': 'pc', 'model': 'allowed2', 'instance_id': 'old2-i'}])
+
     def test_device_only_override_does_not_send_prompt_to_better_ranked_pc(self):
         first = {'key': 'small', 'type': 'llm', 'size_bytes': 1, 'loaded_instances': [{'id': 'a'}]}
         second = {'key': 'large', 'type': 'llm', 'size_bytes': 100, 'loaded_instances': [{'id': 'b'}]}

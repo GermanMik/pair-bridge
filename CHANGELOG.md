@@ -7,6 +7,9 @@
 - Document the start-all-before-poll workflow for compatible MCP clients in English and Russian.
 - Preserve `pair_smart_ask(device=...)` when selecting a model through memory preflight.
 - Detect deferred Unsloth load errors and classify in-band out-of-memory failures before applying the configured unload allowlist.
+- Report confirmed allowlisted unloads cumulatively across rejected smart-selection candidates, with device provenance.
+- Recognize Unsloth's native GPU-fit shortage message in deferred successful-HTTP load responses.
+- Validation: 75 tests passed in the release checkout; 77 passed in the local checkout with existing desktop authentication.
 
 ## 0.7.2
 

@@ -221,6 +221,7 @@ def select_model_for_memory(inventory: list[dict], context_length: int, task_hin
                          max_load_bytes=max_load_bytes)
     errors = []
     configs = management.devices()
+    all_unloaded = []
     for target, item in ranked:
         device_row = next(row for row in inventory if row.get('device') == target)
         try:
@@ -248,15 +249,21 @@ def select_model_for_memory(inventory: list[dict], context_length: int, task_hin
                 prepared = management.preflight_for_load(
                     c, target, item['key'], context_length, config, cap,
                     telemetry.sample(config), lambda: telemetry.sample(config))
+            all_unloaded.extend(dict(row, device=target) for row in prepared['auto_unloaded_instances'])
             _validate_smart_candidate(prepared['candidate'], context_length)
-            return target, prepared['candidate'], prepared['memory'], prepared['auto_unloaded_instances'], errors
+            return target, prepared['candidate'], prepared['memory'], all_unloaded, errors
         except ValueError as exc:
+            all_unloaded.extend(dict(row, device=target) for row in getattr(exc, 'auto_unloaded_instances', []))
             errors.append(f"{target}/{item['key']}: {exc}")
 
     if not ranked:
         raise ValueError('No suitable installed chat model on an online configured device; no download was made')
     details = '; '.join(errors[:4])
-    raise ValueError('No installed chat model passes current memory preflight' + (f': {details}' if details else ''))
+    if all_unloaded:
+        details += '; already released configured instances: ' + management.describe_unloaded_instances(all_unloaded)
+    error = ValueError('No installed chat model passes current memory preflight' + (f': {details}' if details else ''))
+    error.auto_unloaded_instances = all_unloaded
+    raise error
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))

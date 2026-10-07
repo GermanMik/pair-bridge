@@ -155,7 +155,10 @@ def _response_reports_capacity_error(response):
         detail = response.text[:8192].lower()
     except Exception:
         return False
-    return any(marker in detail for marker in (
+    native_shortage = re.search(
+        r'this model needs about \d+(?:\.\d+)? gb of gpu memory at a \d+ context, '
+        r'and \d+(?:\.\d+)? gb is free next to the models already loaded\.', detail)
+    return bool(native_shortage) or any(marker in detail for marker in (
         'out of memory', 'not enough memory', 'insufficient memory',
         'failed to allocate', 'cannot allocate memory', 'cuda error: out of memory',
         'cublas_status_alloc_failed', 'hip out of memory',
@@ -422,6 +425,18 @@ def describe_unloaded_instances(instances):
 
 def preflight_for_load(c, device_id, model_key, context_length, device_config,
                        max_loaded_bytes=None, capacity=None, capacity_sampler=None):
+    """Preserve confirmed unload records even if a later preflight step fails."""
+    unloaded = []
+    try:
+        return _preflight_for_load(c, device_id, model_key, context_length, device_config,
+                                   max_loaded_bytes, capacity, capacity_sampler, unloaded)
+    except ValueError as exc:
+        exc.auto_unloaded_instances = list(unloaded)
+        raise
+
+
+def _preflight_for_load(c, device_id, model_key, context_length, device_config,
+                        max_loaded_bytes, capacity, capacity_sampler, unloaded):
     """Preflight a cold load and, only for exact allowlisted keys, unload instances until it fits."""
     rows = models(c, device_id)
     candidate = next((row for row in rows if row['key'] == model_key), None)
@@ -439,7 +454,6 @@ def preflight_for_load(c, device_id, model_key, context_length, device_config,
     if not allowed:
         raise last_error
 
-    unloaded = []
     for allowed_key in allowed:
         if allowed_key == model_key:
             continue
