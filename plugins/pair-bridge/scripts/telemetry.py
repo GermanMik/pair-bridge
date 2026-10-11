@@ -28,6 +28,8 @@ def _local_memory() -> dict:
             raise ValueError('Cannot parse macOS memory counters')
         counters = {name: int(value.replace('.', '')) for name, value in
                     re.findall(r'^Pages (free|inactive|speculative):\s*([\d.]+)', output, re.MULTILINE)}
+        if not all(name in counters for name in ('free', 'inactive', 'speculative')):
+            raise ValueError('Cannot parse macOS memory counters')
         available = sum(counters.get(name, 0) for name in ('free', 'inactive', 'speculative')) * int(page.group(1))
         return {'total_bytes': total, 'available_bytes': min(total, available),
                 'kind': 'macos_vm_estimate', 'gpu_memory': 'unified_with_system_memory'}

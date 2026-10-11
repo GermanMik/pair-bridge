@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11,<3.15"
-# dependencies = ["mcp==1.29.1", "httpx==0.28.1", "filelock>=3.18,<4", "platformdirs>=4,<5", "jsonschema==4.26.0"]
+# dependencies = ["mcp==1.29.1", "httpx==0.28.1", "filelock>=3.18,<4", "platformdirs>=4,<5", "jsonschema==4.26.0", "zeroconf==0.151.5"]
 # ///
 """Codex MCP tools for the local NVIDIA PAIR OpenAI-compatible proxy."""
 from __future__ import annotations
@@ -9,8 +9,12 @@ import contextlib
 import asyncio
 import difflib
 import management
+import cluster_inventory
 import telemetry
 import benchmarks
+import benchmark_runner
+import benchmark_store
+import benchmark_suites
 import jobs
 import inference_io
 import download_review
@@ -313,12 +317,68 @@ def pair_benchmark(device: str, model: str,
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
-def pair_benchmark_results(profile: Annotated[str, Field(pattern='^(general|code|fast|long_context|analysis)$')],
-                           context_length: Annotated[int, Field(ge=512, le=262144)] = 8192) -> dict:
-    """Read recent benchmark metrics used by automatic model selection."""
-    scores = benchmarks.summaries(profile, context_length)
-    return {'profile': profile, 'minimum_context_length': context_length,
-            'results': [dict(device=d, model=m, **value) for (d, m), value in sorted(scores.items())]}
+def pair_benchmark_results(profile: Annotated[str | None, Field(pattern='^(general|code|fast|long_context|analysis)$')] = None,
+                           context_length: Annotated[int, Field(ge=512, le=262144)] = 8192,
+                           device: str | None = None, model: str | None = None,
+                           suite: Annotated[str | None, Field(pattern='^(smoke|short|full)$')] = None,
+                           run_id: str | None = None,
+                           limit: Annotated[int, Field(ge=1, le=200)] = 50,
+                           offset: Annotated[int, Field(ge=0)] = 0) -> dict:
+    """Read durable suite runs, or legacy profile routing summaries when profile is given.
+
+    Omit profile for quality/speed/error tables. Poll by run_id even after restart.
+    """
+    if profile is not None:
+        if any(value is not None for value in (device, model, suite, run_id)) or limit != 50 or offset != 0:
+            raise ValueError('Use profile for routing summaries, or suite filters without profile')
+        scores = benchmarks.summaries(profile, context_length)
+        return {'profile': profile, 'minimum_context_length': context_length,
+                'results': [dict(device=d, model=m, **value) for (d, m), value in sorted(scores.items())]}
+    return benchmark_store.results(device, model, suite, run_id, limit, offset)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
+def pair_benchmark_suites() -> dict:
+    """Discover versioned nested smoke/short/full suites and their objective checks."""
+    return benchmark_suites.catalog()
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+def pair_benchmark_run(device: str, model: str,
+                       suite: Annotated[str, Field(pattern='^(smoke|short|full)$')] = 'short',
+                       repeats: Annotated[int, Field(ge=1, le=5)] = 3,
+                       max_tokens: Annotated[int, Field(ge=32)] = 256,
+                       request_timeout_seconds: Annotated[int, Field(ge=30, le=1200)] = 180,
+                       enable_thinking: bool | None = None) -> dict:
+    """Start a benchmark job on one exact already-loaded model; never loads/retries.
+
+    Poll pair_job_status(job_id), cancel with pair_job_cancel(job_id).
+    Durable metrics are available via pair_benchmark_results(run_id), including partial failures.
+    """
+    data = benchmark_runner.validate_request(device, model, suite, repeats, max_tokens,
+                                              request_timeout_seconds, enable_thinking)
+    row = benchmark_store.create(device, model, data, repeats, max_tokens,
+                                 request_timeout_seconds, enable_thinking)
+    try:
+        job = jobs.create(device, model, benchmark_runner.worker, row, data, inference_lock)
+    except Exception:
+        row.update(status='failed', error_code='job_start_failed')
+        benchmark_store.persist(row)
+        raise
+    if job['status'] == 'failed' and job.get('error_code') == 'worker_start_failed':
+        row.update(status='failed', error_code='worker_start_failed')
+        benchmark_store.persist(row)
+    return {'job_id': job['job_id'], 'run_id': row['run_id'], 'device': device, 'model': model,
+            'suite': suite, 'suite_version': data['suite_version'], 'status': job['status'],
+            'expected_samples': len(data['cases']) * repeats,
+            'request_timeout_seconds': request_timeout_seconds, 'enable_thinking': enable_thinking,
+            'notice': 'One warmup excluded. No model loading, retries or fallback; prompts and answers are not saved.'}
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
+def pair_benchmark_compare(run_ids: list[str]) -> dict:
+    """Compare 1-20 completed runs of the same workload; return metrics and Markdown table."""
+    return benchmark_store.compare(run_ids)
 
 
 @contextlib.contextmanager
@@ -353,15 +413,31 @@ def pair_list(device: str | None = None) -> dict:
     a health check and does not mean the model is loaded. Use an exact returned ID.
     """
     if device is not None:
+        if device.startswith('pair-') and device not in management.devices():
+            inventory = cluster_inventory.inspect()
+            for node in inventory['nodes']:
+                if node['device'] == device:
+                    return node
+            raise ValueError('Unknown native PAIR node; refresh pair_devices')
         with management.client(device) as c:
             rows = management.models(c, device)
             return {'device': device, 'online': True, 'checked_at': datetime.now(timezone.utc).isoformat(),
                     'models': checked_models(device, rows),
                     'resources': resource_summary(rows, management.devices()[device].get('max_loaded_bytes')),
                     'source': management.engine_for(device) + ' model API'}
-    routed = catalog()
+    cluster = cluster_inventory.inspect()
+    cluster_models = [model for node in cluster['nodes'] for model in node['models']]
+    router_status = 'available'
+    router_http_status = None
+    try:
+        routed = catalog()
+    except ValueError as exc:
+        routed = []
+        router_status = 'unavailable'
+        match = re.search(r'HTTP (\d{3})', str(exc))
+        router_http_status = int(match.group(1)) if match else None
     if routed:
-        return {'endpoint': BASE_URL, 'models': routed, 'source': 'PAIR routing catalog',
+        return {'endpoint': BASE_URL, 'models': routed, 'cluster_models': cluster_models, 'cluster_inventory': cluster, 'source': 'PAIR routing catalog',
                 'notice': 'Catalog only; model availability must be confirmed by a successful request.'}
     installed, errors = [], []
     for name in management.devices():
@@ -377,9 +453,10 @@ def pair_list(device: str | None = None) -> dict:
                                   'availability': row['availability']})
         except ValueError:
             errors.append({'device': name, 'status': 'offline'})
-    return {'endpoint': BASE_URL, 'models': installed, 'source': 'configured device inventory fallback',
-            'router_models': [], 'device_errors': errors,
-            'notice': ('PAIR routing catalog is empty. These models are installed, not router-advertised. '
+    return {'endpoint': BASE_URL, 'models': installed, 'cluster_models': cluster_models, 'cluster_inventory': cluster, 'source': 'configured device inventory fallback',
+            'router_models': [], 'device_errors': errors, 'router_status': router_status, 'router_http_status': router_http_status,
+            'router_error': 'PAIR catalog request failed; no retry or inference fallback was made.' if router_status == 'unavailable' else None,
+            'notice': ('PAIR routing catalog is empty or unavailable. These models are installed, not router-advertised. '
                        'Use pair_smart_ask, or pair_load followed by pair_ask with the returned device; no download is required.')}
 
 
@@ -449,6 +526,8 @@ def pair_capabilities() -> dict:
     while background inference overlaps. This is not distributed inference of one model.
     """
     return {
+        'model_downloads_supported': False,
+        'model_loading': 'installed models into RAM/VRAM only',
         'cross_device_parallel_jobs': True,
         'model_capability_discovery': 'pair_model_capabilities',
         'structured_output': ['pair_ask', 'pair_smart_ask', 'pair_job_start', 'pair_batch_start', 'pair_vision_ask'],
@@ -456,6 +535,9 @@ def pair_capabilities() -> dict:
         'batch_jobs': ['pair_batch_start', 'pair_batch_status', 'pair_batch_cancel'],
         'embeddings': 'pair_embeddings (explicit already-loaded embedding instance)',
         'vision': 'pair_vision_ask (confirmed vision metadata, inline images)',
+        'benchmarks': {'suites': 'pair_benchmark_suites', 'start': 'pair_benchmark_run',
+                       'results': 'pair_benchmark_results (omit profile)', 'compare': 'pair_benchmark_compare',
+                       'requires': 'one exact already-loaded chat instance', 'durable_key': 'run_id'},
         'configured_devices': list(management.devices()),
         'workflow': ['pair_devices', 'pair_list', 'pair_job_start for each target',
                      'pair_job_status for each job_id'],
@@ -476,7 +558,7 @@ def pair_devices() -> dict:
     """Inspect every configured device, including installed and loaded local models.
 
     Reports each unreachable device separately. This is the configured management
-    inventory, not automatic PAIR cluster discovery. No model is loaded by this call.
+    inventory plus native paired-node read-only inventory. No model is loaded by this call.
     """
     result = []
     for name, config in management.devices().items():
@@ -489,11 +571,13 @@ def pair_devices() -> dict:
                                'resources': resource_summary(models, config.get('max_loaded_bytes')),
                                'capacity': telemetry.sample(config)})
         except ValueError as exc:
-            result.append({'device': name, 'online': False,
-                           'checked_at': datetime.now(timezone.utc).isoformat(),
-                           'check_status': 'unreachable', 'error': str(exc)})
-    return {'devices': result, 'capabilities': pair_capabilities(),
-            'notice': 'Management covers explicitly configured LM Studio and Unsloth devices only. PAIR routing catalog remains pair_list().'}
+            failure = diagnostics.device_failure(exc)
+            result.append({'device': name, 'checked_at': datetime.now(timezone.utc).isoformat(),
+                           'check_status': 'authentication_required' if failure.get('auth_status') else ('unreachable' if failure['online'] is False else 'inspection_failed'),
+                           **failure})
+    cluster = cluster_inventory.inspect()
+    return {'devices': result + cluster['nodes'], 'cluster_inventory_status': cluster['status'],
+            'capabilities': pair_capabilities(), 'notice': cluster['notice']}
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
@@ -1001,6 +1085,7 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
             finally:
                 with job.lock:
                     job.loop, job.task = None, None
+                loop.run_until_complete(loop.shutdown_asyncgens())
                 loop.close()
             if job.cancel_event.is_set():
                 job.update(status='cancelled', stage='cancelled')
@@ -1287,114 +1372,45 @@ def pair_diagnose() -> dict:
                          'chat_models': sum(m.get('type') == 'llm' for m in models),
                          'loaded_instances': sum(len(m['loaded_instances']) for m in models)})
         except ValueError as exc:
-            rows.append({'device': name, 'online': False, 'error': str(exc)})
+            rows.append({'device': name, **diagnostics.device_failure(exc)})
     try:
         advertised = len(catalog())
         router = {'online': True, 'advertised_models': advertised}
     except ValueError:
         router = {'online': False, 'error': 'PAIR router unavailable or catalog invalid'}
+    inventory = cluster_inventory.inspect()
+    discovery = {'status': inventory.get('network_discovery_status', 'unknown'),
+                 'nodes': [{k: node.get(k) for k in ('device', 'source', 'online', 'network_present',
+                            'peer_pin_available', 'model_inventory_status')} for node in inventory['nodes']],
+                 'hint': 'Discovery does not grant trust. Pair remote devices in NVIDIA PAIR before reading their models. Empty discovery does not identify a firewall failure; check awake devices, PAIR service and LAN connectivity.'}
     recent, journal_status = diagnostics.recent_with_status()
     explanations = {'timeout': 'The device did not finish before the request deadline; inspect its load state before retrying.',
                     'device_unreachable': 'The device engine could not be reached; check its server and SSH/Tailscale path.',
                     'model_not_installed': 'The requested model is not installed on an online configured device.',
                     'empty_answer': 'The model returned no final text; a larger output budget may be needed.',
+                    'device_busy': 'Another Bridge request owns the device lock; synchronous/other-process calls may not appear in pair_job_list.',
+                    'load_timeout': 'Total loading deadline reached; engine may still be loading. Inspect inventory before retrying.',
                     'load_failed': 'Loading did not complete or could not be confirmed; inspect memory and engine state.',
                     'request_failed': 'The request failed; check local engine logs without sharing prompts or tokens.'}
-    return {'devices': rows, 'router': router, 'request_journal_status': journal_status,
+    return {'devices': rows, 'router': router, 'discovery': discovery, 'request_journal_status': journal_status,
             'recent_requests': [dict(row, explanation=explanations.get(row.get('reason')))
                                 for row in recent]}
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
 def pair_download_plan(device: str, model: str, estimated_size_bytes: Annotated[int | None, Field(ge=1)] = None,
                        destination: str = '', quantization: str | None = None) -> dict:
-    """Prepare a one-use download review with independent metadata and disk checks.
-
-    LM Studio's download API reveals total size only after starting. Inspect the model
-    source, expected size and configured storage location independently before planning.
-    """
-    if not model or len(model) > 512 or not destination.strip() or len(destination) > 1024:
-        raise ValueError('Provide an exact model ID and reviewed destination')
-    if quantization is not None and not re.fullmatch(r'[A-Za-z0-9_.-]{1,32}', quantization):
-        raise ValueError('Invalid quantization')
-    if model.startswith('https://'):
-        parts = urlsplit(model)
-        if parts.hostname != 'huggingface.co' or parts.username or parts.password or parts.query or parts.fragment:
-            raise ValueError('Only exact huggingface.co HTTPS links are accepted as model URLs')
-        source = model
-    elif re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+', model):
-        if quantization:
-            raise ValueError('Quantization is supported only for Hugging Face repository links')
-        source = 'LM Studio catalog: ' + model
-    else:
-        raise ValueError('Use an exact LM Studio catalog ID or huggingface.co model URL')
-    configured = management.devices()
-    if device not in configured:
-        raise ValueError('Unknown device. Use pair_devices and an exact configured ID')
-    if configured[device].get('engine', 'lmstudio') != 'lmstudio':
-        raise ValueError('Model downloads are supported only for LM Studio devices')
-    files = download_review.model_files(model, quantization)
-    verified_bytes = files.get('size_bytes') if files['status'] == 'verified_file' else None
-    planning_bytes = verified_bytes or estimated_size_bytes
-    if planning_bytes is None:
-        raise ValueError('File size is unknown; provide a reviewed estimated_size_bytes before planning')
-    space = download_review.destination_space(configured[device], destination, round(planning_bytes * 1.1))
-    if space['status'] == 'insufficient':
-        raise ValueError('Destination filesystem has less than the planned size plus 10% headroom')
-    plan_id = uuid.uuid4().hex
-    _DOWNLOAD_PLANS[plan_id] = {'device': device, 'model': model, 'quantization': quantization,
-                                'estimated_size_bytes': planning_bytes, 'verified_file': files if verified_bytes else None,
-                                'destination': destination, 'created': time.monotonic()}
-    return {'plan_id': plan_id, 'device': device, 'model': model, 'source': source,
-            'estimated_disk_and_network_bytes': planning_bytes,
-            'size_source': 'huggingface_file_metadata' if verified_bytes else 'caller_estimate',
-            'model_file': files, 'destination': destination, 'destination_space': space,
-            'quantization': quantization,
-            'notice': 'Verify LM Studio storage settings and exact model variant. A repository file size may differ from the complete job. Plan expires in 10 minutes; ask never downloads.'}
+    """Disabled compatibility entry point: Bridge only loads installed models."""
+    raise ValueError("Model downloads are disabled; install model files in the engine, then use pair_load")
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True))
 def pair_download(plan_id: str, confirm_model: str) -> dict:
-    """Start a download from one reviewed plan, with the exact model ID repeated explicitly."""
-    plan = _DOWNLOAD_PLANS.get(plan_id)
-    if not plan or time.monotonic() - plan['created'] > 600:
-        raise ValueError('Download plan is missing or expired; prepare a new plan')
-    if plan['model'] != confirm_model:
-        raise ValueError('Repeat the exact model ID in confirm_model before starting a download')
-    del _DOWNLOAD_PLANS[plan_id]
-    device, model, quantization = plan['device'], plan['model'], plan['quantization']
-    if plan['verified_file']:
-        current = download_review.model_files(model, quantization)
-        if current.get('status') != 'verified_file' or any(
-            current.get(key) != plan['verified_file'].get(key) for key in ('revision', 'file', 'size_bytes')
-        ):
-            raise ValueError('Hugging Face file metadata changed or is unavailable; prepare a new download plan')
-    if management.engine_for(device) != 'lmstudio':
-        raise ValueError('Model downloads are supported only for LM Studio devices')
-    space = download_review.destination_space(management.devices()[device], plan['destination'],
-                                              round(plan['estimated_size_bytes'] * 1.1))
-    if space['status'] == 'insufficient':
-        raise ValueError('Destination free space changed; prepare a new download plan')
-    with management.client(device) as c:
-        body = {'model': model}
-        if quantization:
-            body['quantization'] = quantization
-        result = management.request(c, 'POST', '/api/v1/models/download', body)
-    return {'device': device, 'model': model, 'job_id': result.get('job_id'),
-            'status': result.get('status'), 'total_size_bytes': result.get('total_size_bytes')}
+    """Disabled compatibility entry point: Bridge only loads installed models."""
+    raise ValueError("Model downloads are disabled; install model files in the engine, then use pair_load")
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
 def pair_download_status(device: str, job_id: str) -> dict:
-    """Read the progress of an explicitly started LM Studio download job."""
-    if not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', job_id):
-        raise ValueError('Invalid download job ID')
-    if management.engine_for(device) != 'lmstudio':
-        raise ValueError('Model downloads are supported only for LM Studio devices')
-    with management.client(device) as c:
-        result = management.request(c, 'GET', '/api/v1/models/download/status/' + job_id)
-    return {'device': device, 'job_id': job_id, **{k: result[k] for k in
-            ('status', 'total_size_bytes', 'downloaded_bytes', 'bytes_per_second', 'estimated_completion') if k in result}}
+    """Disabled compatibility entry point: Bridge only loads installed models."""
+    raise ValueError("Model downloads are disabled; install model files in the engine, then use pair_load")
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True))

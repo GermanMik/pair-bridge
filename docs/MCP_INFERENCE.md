@@ -52,4 +52,4 @@ The [embedding request](https://lmstudio.ai/docs/developer/openai-compat/embeddi
 
 The tool sends OpenAI multimodal content (`text` and `image_url` parts) directly to the configured engine. It never reads filesystem paths or fetches remote image URLs. Image contents are not stored in diagnostics, journals or memory. Unsupported formats, unknown capabilities, ambiguous/unloaded instances and engine errors are reported without retry or fallback. Optional structured output uses the same local checks as text requests.
 
-Benchmark improvements are deferred; existing benchmark checks and scoring are unchanged.
+Versioned local smoke/short/full benchmarks, durable results and comparison tables are described in [BENCHMARKS.md](BENCHMARKS.md). Existing literal benchmark calls remain compatible.

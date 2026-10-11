@@ -1,5 +1,7 @@
 """Device-scoped local model engine management; never starts a second PAIR broker."""
+import asyncio
 import contextlib
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
 from pathlib import Path
@@ -41,6 +43,18 @@ def devices():
         key = row.get('api_key_env')
         if key is not None and (not isinstance(key, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key)):
             raise ValueError('api_key_env must name an environment variable')
+        desktop_secret = row.get('desktop_secret_file')
+        if desktop_secret is not None:
+            if (row.get('engine') != 'unsloth' or host or key or p.scheme != 'http' or
+                    p.hostname not in ('localhost', '127.0.0.1', '::1')):
+                raise ValueError('desktop_secret_file requires local loopback Unsloth without SSH or api_key_env')
+            if (not isinstance(desktop_secret, str) or not desktop_secret or len(desktop_secret) > 512 or
+                    any(ch in desktop_secret for ch in '\r\n\x00') or
+                    not Path(desktop_secret).is_absolute()):
+                raise ValueError('desktop_secret_file must be an absolute path')
+        load_timeout = row.get('load_timeout_seconds', 180)
+        if not isinstance(load_timeout, int) or isinstance(load_timeout, bool) or not 1 <= load_timeout <= 3600:
+            raise ValueError('load_timeout_seconds must be an integer from 1 to 3600')
         cap = row.get('max_loaded_bytes')
         if cap is not None and (not isinstance(cap, int) or isinstance(cap, bool) or cap <= 0):
             raise ValueError('max_loaded_bytes must be a positive integer')
@@ -122,12 +136,54 @@ def client(device_id):
     with endpoint(device) as url:
         with httpx.Client(base_url=url, timeout=180, trust_env=False, follow_redirects=False,
                           headers={'Authorization': 'Bearer ' + key} if key else {}) as c:
+            if device.get('desktop_secret_file'):
+                try:
+                    credential = Path(device['desktop_secret_file'])
+                    if credential.stat().st_size > 8192:
+                        raise ValueError('Configured Unsloth desktop credential file is invalid')
+                    secret = credential.read_text(encoding='utf-8-sig').strip()
+                except (OSError, UnicodeError) as exc:
+                    raise ValueError('Configured Unsloth desktop credential file is unreadable') from exc
+                if not secret or len(secret) > 8192:
+                    raise ValueError('Configured Unsloth desktop credential file is invalid')
+                auth = request(c, 'POST', '/api/auth/desktop-login', {'secret': secret})
+                token = auth.get('access_token')
+                if not isinstance(token, str) or not 1 <= len(token) <= 8192 or any(ord(ch) < 33 or ord(ch) > 126 for ch in token):
+                    raise ValueError('Unsloth desktop login did not return a valid access token')
+                c.headers['Authorization'] = 'Bearer ' + token
             yield c
 
 
-def request(c, method, route, body=None):
+async def _bounded_load_request(c, method, route, body, total_timeout):
+    # Async cancellation bounds headers and body even while the engine sends progress.
+    # It closes only our HTTP stream; the engine may still be loading the model.
+    async with asyncio.timeout(total_timeout):
+        async with httpx.AsyncClient(base_url=str(c.base_url), headers=c.headers,
+                                     cookies=c.cookies, timeout=min(180, total_timeout),
+                                     trust_env=False, follow_redirects=False) as client:
+            async with client.stream(method, route, json=body) as response:
+                data = bytearray()
+                async for chunk in response.aiter_bytes():
+                    if len(data) + len(chunk) > 1024 * 1024:
+                        raise ValueError('Device load response exceeded size limit; inspect status before retrying')
+                    data.extend(chunk)
+                return httpx.Response(response.status_code, content=bytes(data))
+
+
+def _load_request_on_private_loop(c, method, route, body, total_timeout):
+    # FastMCP can call synchronous tools from its running event loop. Never nest
+    # asyncio.run there; keep the cancellable load transport on a private worker.
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix='pair-load-deadline') as worker:
+        return worker.submit(lambda: asyncio.run(
+            _bounded_load_request(c, method, route, body, total_timeout))).result()
+
+
+def request(c, method, route, body=None, *, total_timeout=None):
     try:
-        r = c.request(method, route, json=body)
+        r = (c.request(method, route, json=body) if total_timeout is None else
+             _load_request_on_private_loop(c, method, route, body, total_timeout))
+    except TimeoutError as exc:
+        raise ValueError('Device load timed out at its total deadline; model may still be loading. Inspect status before retrying') from exc
     except httpx.TimeoutException as exc:
         raise ValueError('Device timed out; operation may still be running. Inspect status before retrying') from exc
     except httpx.RequestError as exc:
@@ -249,16 +305,17 @@ def find_model(c, key, device_id=None):
 
 
 def load_model(c, device_id, model_key, context_length, model_type='llm'):
+    total_timeout = devices().get(device_id, {}).get('load_timeout_seconds', 180)
     if engine_for(device_id) == 'unsloth':
         return request(c, 'POST', '/api/inference/load', {
             'model_path': model_key,
             'n_ctx': context_length,
             'max_seq_length': context_length,
-        })
+        }, total_timeout=total_timeout)
     body = {'model': model_key}
     if model_type == 'llm':
         body['context_length'] = context_length
-    return request(c, 'POST', '/api/v1/models/load', body)
+    return request(c, 'POST', '/api/v1/models/load', body, total_timeout=total_timeout)
 
 
 def load_with_auto_unload(c, device_id, model_key, context_length, model_type, device_config):

@@ -57,9 +57,8 @@ def pair_request(method: str, route: str, body: dict | None = None) -> dict:
     return result
 
 
-def models() -> list[dict]:
+def router_models() -> list[dict]:
     result = []
-    # Preserve PAIR router IDs for normal routed inference.
     try:
         data = pair_request('GET', '/models').get('data', [])
         for item in data:
@@ -68,6 +67,11 @@ def models() -> list[dict]:
                 result.append({'id': item['id'], 'object': 'model', 'owned_by': 'PAIR'})
     except (ValueError, httpx.HTTPError):
         pass
+    return result
+
+
+def models() -> list[dict]:
+    result = router_models()
     # Device-qualified IDs avoid collisions and permit exact host selection.
     for device in management.devices():
         try:
@@ -82,7 +86,9 @@ def models() -> list[dict]:
         except (ValueError, httpx.HTTPError):
             continue
     # Router models take precedence if an upstream happens to share a device ID.
-    unique = {item['id']: item for item in result}
+    unique = {}
+    for item in result:
+        unique.setdefault(item['id'], item)
     return list(unique.values())
 
 
@@ -174,7 +180,8 @@ class Handler(BaseHTTPRequestHandler):
             wants_stream = body.get('stream') is True
             # The upstream call is non-streaming; stream its completed result to OpenAI clients.
             body['stream'] = False
-            if model.startswith(PREFIX):
+            # Preserve router precedence in inference as well as catalog display.
+            if model.startswith(PREFIX) and not any(item['id'] == model for item in router_models()):
                 rest = model[len(PREFIX):]
                 device, sep, model_id = rest.partition('/')
                 if not sep or device not in management.devices() or not model_id:

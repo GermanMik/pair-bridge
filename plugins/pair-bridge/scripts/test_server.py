@@ -241,7 +241,7 @@ class BridgeTests(unittest.TestCase):
         cold = {'key': 'candidate', 'type': 'llm', 'loaded_instances': []}
         warm = dict(cold, loaded_instances=[{'id': 'foreign-16bit-i'}])
         prepared = {'candidate': cold, 'memory': {}, 'auto_unloaded_instances': []}
-        def native_reply(c, method, route, body):
+        def native_reply(c, method, route, body, **kwargs):
             if route == '/api/inference/load':
                 self.assertNotIn('load_in_4bit', body)
                 self.assertEqual(body['max_seq_length'], 8192)
@@ -433,7 +433,7 @@ class BridgeTests(unittest.TestCase):
         responses = [cold, warm, warm, {'key': 'cold', 'type': 'llm', 'loaded_instances': []}]
         prepared = {'rows': [cold], 'candidate': cold, 'memory': {'status': 'estimated'},
                     'auto_unloaded_instances': []}
-        def send(_c, _method, route, _body):
+        def send(_c, _method, route, _body, **kwargs):
             if route == '/api/v1/models/load':
                 return {'instance_id': 'owned-i'}
             if route == '/v1/chat/completions':
@@ -458,7 +458,7 @@ class BridgeTests(unittest.TestCase):
         snapshot = {'devices': [{'device': 'mac', 'online': True, 'models': [cold]}]}
         prepared = {'rows': [cold], 'candidate': cold, 'memory': {'status': 'estimated'},
                     'auto_unloaded_instances': []}
-        def send(_c, _method, route, _body):
+        def send(_c, _method, route, _body, **kwargs):
             if route == '/api/v1/models/load':
                 return {'instance_id': 'owned-i'}
             if route == '/v1/chat/completions':
@@ -492,35 +492,33 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(result['verification_status'], 'requires_codex_source_review')
 
     def test_download_requires_repeated_exact_model(self):
-        with patch.object(server.management, 'devices', return_value={'mac': {}}), patch.object(server.management, 'client') as factory:
-            plan = server.pair_download_plan('mac', 'actual/model', 1000000, '/reviewed/models')
-            with self.assertRaisesRegex(ValueError, 'Repeat the exact'):
-                server.pair_download(plan['plan_id'], 'other/model')
-            factory.assert_not_called()
+        with patch.object(server.management, "client") as client, patch.object(server.download_review, "model_files") as metadata:
+            with self.assertRaisesRegex(ValueError, "downloads are disabled"):
+                server.pair_download_plan("fixture", "fixture/model")
+            client.assert_not_called()
+            metadata.assert_not_called()
 
     def test_download_plan_is_one_use_and_exposes_review_fields(self):
-        with patch.object(server.management, 'devices', return_value={'mac': {}}), patch.object(server.management, 'client') as factory, \
-             patch.object(server.management, 'request', return_value={'job_id': 'job1', 'status': 'downloading', 'total_size_bytes': 1100000}):
-            factory.return_value.__enter__.return_value = object()
-            plan = server.pair_download_plan('mac', 'actual/model', 1000000, '/reviewed/models')
-            self.assertEqual(plan['estimated_disk_and_network_bytes'], 1000000)
-            self.assertEqual(plan['source'], 'LM Studio catalog: actual/model')
-            self.assertEqual(plan['destination'], '/reviewed/models')
-            self.assertEqual(server.pair_download(plan['plan_id'], 'actual/model')['job_id'], 'job1')
-            with self.assertRaisesRegex(ValueError, 'missing or expired'):
-                server.pair_download(plan['plan_id'], 'actual/model')
+        with patch.object(server.management, "client") as client, patch.object(server.download_review, "model_files") as metadata:
+            with self.assertRaisesRegex(ValueError, "downloads are disabled"):
+                server.pair_download_plan("fixture", "fixture/model")
+            client.assert_not_called()
+            metadata.assert_not_called()
 
     def test_download_plan_rejects_untrusted_url(self):
-        with patch.object(server.management, 'devices', return_value={'mac': {}}):
-            with self.assertRaisesRegex(ValueError, 'huggingface.co'):
-                server.pair_download_plan('mac', 'https://example.com/model', 100, '/models')
+        with patch.object(server.management, "client") as client, patch.object(server.download_review, "model_files") as metadata:
+            with self.assertRaisesRegex(ValueError, "downloads are disabled"):
+                server.pair_download_plan("fixture", "fixture/model")
+            client.assert_not_called()
+            metadata.assert_not_called()
 
     def test_diagnostics_omits_private_router_url_and_model_names(self):
         rows = [{'key': 'private-model', 'type': 'llm', 'loaded_instances': [{'id': 'secret-instance'}]}]
         with patch.object(server.management, 'devices', return_value={'mac': {}}), \
              patch.object(server.management, 'client') as factory, \
              patch.object(server.management, 'models', return_value=rows), \
-             patch.object(server, 'catalog', return_value=[{'id': 'private-model'}]):
+             patch.object(server, 'catalog', return_value=[{'id': 'private-model'}]), \
+             patch.object(server.cluster_inventory, 'inspect', return_value={'nodes': []}):
             factory.return_value.__enter__.return_value = object()
             result = server.pair_diagnose()
         self.assertEqual(result['devices'][0]['loaded_instances'], 1)
@@ -663,8 +661,8 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                 tools = (await session.list_tools()).tools
                 self.assertEqual({t.name for t in tools}, {'pair_capabilities', 'pair_list', 'pair_ask', 'pair_devices', 'pair_load', 'pair_unload', 'pair_memory_plan',
                                                           'pair_smart_ask', 'pair_compare', 'pair_diagnose',
-                                                          'pair_download_plan', 'pair_download', 'pair_download_status',
                                                           'pair_decide', 'pair_score', 'pair_benchmark', 'pair_benchmark_results',
+                                                          'pair_benchmark_suites', 'pair_benchmark_run', 'pair_benchmark_compare',
                                                           'pair_job_start', 'pair_job_status', 'pair_job_cancel', 'pair_job_recover',
                                                           'pair_model_capabilities', 'pair_job_list', 'pair_batch_start', 'pair_batch_status',
                                                           'pair_batch_cancel', 'pair_embeddings', 'pair_vision_ask'})

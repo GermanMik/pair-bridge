@@ -6,6 +6,9 @@ import os
 from pathlib import Path
 import statistics
 import time
+import sqlite3
+
+import benchmark_store
 
 from platformdirs import user_cache_path
 
@@ -36,6 +39,12 @@ def save(device: str, model: str, profile: str, context_length: int, outcomes: l
 
 
 def summaries(profile: str, context_length: int, max_age_days: int = 30) -> dict[tuple[str, str], dict]:
+    try:
+        measured = benchmark_store.routing(profile, context_length, max_age_days)
+    except (OSError, sqlite3.Error):
+        measured = {}  # Optional history must not prevent ordinary inference.
+    if measured:
+        return measured
     target = path()
     if not target.exists():
         return {}

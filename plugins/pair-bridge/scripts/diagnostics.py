@@ -13,12 +13,34 @@ from platformdirs import user_cache_path
 _current = contextvars.ContextVar('pair_trace', default=None)
 
 
+def device_failure(exc):
+    """Whitelist diagnostic outcomes; never echo engine error bodies or origins."""
+    message = str(exc).lower()
+    if ('http 401' in message or 'http 403' in message or
+            'api token environment variable is missing' in message or
+            'desktop credential' in message or 'desktop login' in message):
+        return {'online': None, 'auth_status': 'required', 'reason': 'auth_required',
+                'error': 'Engine authorization is required or misconfigured.',
+                'hint': 'Check the configured API-key environment variable or local desktop credential. For remote keyless Unsloth, verify Chat and inference access; Full access is localhost-only.'}
+    if 'unreachable' in message or 'timed out' in message or 'ssh tunnel' in message:
+        return {'online': False, 'reason': 'device_unreachable',
+                'error': 'Configured engine could not be reached.',
+                'hint': 'Check that the device is awake and its API server is listening at the configured origin. No port scan or inference retry was made.'}
+    return {'online': None, 'reason': 'inspection_failed',
+            'error': 'Engine inspection failed or its response was invalid.',
+            'hint': 'Inspect local engine settings/logs without sharing credentials or prompts.'}
+
+
 def journal_path() -> Path:
     return user_cache_path('codex-pair-bridge', appauthor=False) / 'requests.jsonl'
 
 
 def reason(exc: Exception) -> str:
     message = str(exc).lower()
+    if 'another codex pair request is running' in message:
+        return 'device_busy'
+    if 'load timed out at its total deadline' in message:
+        return 'load_timeout'
     if 'timed out' in message or 'timeout' in message:
         return 'timeout'
     if 'unreachable' in message or 'cannot reach' in message:

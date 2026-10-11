@@ -9,6 +9,7 @@ from unittest.mock import patch
 import httpx
 
 import benchmarks
+import benchmark_store
 import jobs
 import management
 import server
@@ -27,7 +28,9 @@ class OperationsTests(unittest.TestCase):
                 management.memory_preflight('pc', [candidate], candidate, 8192, None, capacity)
 
     def test_benchmark_ranking_is_measured_and_prompt_free(self):
-        with tempfile.TemporaryDirectory() as temp, patch.object(benchmarks, 'path', return_value=Path(temp) / 'bench.jsonl'):
+        with tempfile.TemporaryDirectory() as temp, \
+             patch.object(benchmarks, 'path', return_value=Path(temp) / 'bench.jsonl'), \
+             patch.object(benchmark_store, 'path', return_value=Path(temp) / 'runs.sqlite3'):
             record = benchmarks.save('pc', 'measured', 'code', 8192,
                                      [{'passed': True, 'latency_ms': 100},
                                       {'passed': True, 'latency_ms': 120},

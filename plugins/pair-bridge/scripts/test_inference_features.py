@@ -99,7 +99,7 @@ class FeatureTests(unittest.TestCase):
     def test_inference_schemas_have_no_fixed_output_token_maximum(self):
         async def inspect():
             tools = {tool.name: tool.inputSchema for tool in await server.mcp.list_tools()}
-            for name in ['pair_ask', 'pair_smart_ask', 'pair_job_start', 'pair_vision_ask', 'pair_compare']:
+            for name in ['pair_ask', 'pair_smart_ask', 'pair_job_start', 'pair_vision_ask', 'pair_compare', 'pair_benchmark_run']:
                 field = tools[name]['properties']['max_tokens']
                 self.assertNotIn('maximum', field, name)
                 self.assertEqual(field['minimum'], 32)

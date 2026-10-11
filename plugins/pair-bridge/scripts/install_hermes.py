@@ -78,6 +78,13 @@ def main() -> None:
                 fail(f'PAIR gateway exited during startup. See {log_path}')
             time.sleep(.25)
         else:
+            # Only stop the process this invocation owns; reused gateways stay intact.
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
             fail(f'PAIR gateway did not start. See {log_path}')
 
     # Use Hermes' own config writer so existing YAML settings are preserved.

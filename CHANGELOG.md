@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.2 (unreleased)
+
+- Add nested, versioned bilingual smoke (6), short (20) and full (100) benchmark suites, background runs, metrics-only history, comparisons and routing eligibility for compatible completed short/full runs.
+- Preserve exact loaded-instance targeting, cancellation, workload-aware comparisons, objective validators and no prompt/answer persistence; retain verified benchmark request and history fixes.
+- Bound total model loading to 180 seconds by default, configurable per device from 1 to 3600 seconds; deadlines cover headers and body and release Bridge locks on timeout.
+- Keep model weights installed through the engine: Bridge loads existing files into RAM/VRAM and rejects disabled download entry points before network or configuration access.
+- On ambiguous load timeout, inspect engine state before retrying; the engine may continue loading.
 ## 0.8.0
 
 - Add fresh per-model capability and context discovery, including explicit `supported`, `unsupported`, and `unknown` states.
@@ -35,3 +42,6 @@
 - Require Unsloth models to be loaded through PAIR Bridge before direct chat so memory preflight and the configured unload allowlist apply.
 - Keep Unsloth memory estimates independent of the LM Studio `lms` CLI.
 - Expand English and Russian setup, safety, and tool documentation for Unsloth Studio.
+
+### Local paired-node visibility fix
+- Automatically discover native NVIDIA PAIR devices over mDNS, refresh model inventories and use the paired roster as fallback alongside configured engines. Keep native IDs read-only and unknown/offline states explicit. See docs/CLUSTER_INVENTORY.md.

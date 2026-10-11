@@ -26,32 +26,18 @@ class DownloadReviewTests(unittest.TestCase):
         self.assertEqual(result['status'], 'ambiguous')
 
     def test_download_plan_uses_verified_size_and_rejects_low_space(self):
-        metadata = {'status': 'verified_file', 'size_bytes': 1000, 'revision': 'sha'}
-        with patch.object(server.management, 'devices', return_value={'mac': {}}), \
-             patch.object(server.download_review, 'model_files', return_value=metadata), \
-             patch.object(server.download_review, 'destination_space', return_value={'status': 'enough'}) as space:
-            result = server.pair_download_plan('mac', 'https://huggingface.co/owner/repo',
-                                               destination='/models', quantization='Q4_K_M')
-        self.assertEqual(result['size_source'], 'huggingface_file_metadata')
-        self.assertEqual(result['estimated_disk_and_network_bytes'], 1000)
-        self.assertEqual(space.call_args.args[-1], 1100)
-        with patch.object(server.management, 'devices', return_value={'mac': {}}), \
-             patch.object(server.download_review, 'model_files', return_value=metadata), \
-             patch.object(server.download_review, 'destination_space', return_value={'status': 'insufficient'}):
-            with self.assertRaisesRegex(ValueError, 'less than'):
-                server.pair_download_plan('mac', 'https://huggingface.co/owner/repo', destination='/models')
+        with patch.object(server.management, "client") as client, patch.object(server.download_review, "model_files") as metadata:
+            with self.assertRaisesRegex(ValueError, "downloads are disabled"):
+                server.pair_download_plan("fixture", "fixture/model")
+            client.assert_not_called()
+            metadata.assert_not_called()
 
     def test_download_rechecks_revision_before_start(self):
-        metadata = {'status': 'verified_file', 'size_bytes': 1000, 'revision': 'old', 'file': 'q4.gguf'}
-        with patch.object(server.management, 'devices', return_value={'mac': {}}), \
-             patch.object(server.download_review, 'model_files', return_value=metadata), \
-             patch.object(server.download_review, 'destination_space', return_value={'status': 'enough'}):
-            plan = server.pair_download_plan('mac', 'https://huggingface.co/owner/repo', destination='/models')
-        with patch.object(server.download_review, 'model_files', return_value=dict(metadata, revision='new')), \
-             patch.object(server.management, 'request') as request:
-            with self.assertRaisesRegex(ValueError, 'metadata changed'):
-                server.pair_download(plan['plan_id'], plan['model'])
-            request.assert_not_called()
+        with patch.object(server.management, "client") as client, patch.object(server.download_review, "model_files") as metadata:
+            with self.assertRaisesRegex(ValueError, "downloads are disabled"):
+                server.pair_download_plan("fixture", "fixture/model")
+            client.assert_not_called()
+            metadata.assert_not_called()
 
 
 if __name__ == '__main__':

@@ -201,13 +201,9 @@ For an installed but unloaded model, ask Codex to call `pair_memory_plan` with i
 
 The result reports the candidate estimate, estimates for already loaded instances at their actual contexts, `required_with_headroom_bytes`, and a fresh device-capacity sample. A cold load is blocked if the estimated additional need plus 10% exceeds measured available RAM or NVIDIA VRAM. You can also set `"max_loaded_bytes": 34359738368` (32 GiB) as an independent total-load policy. Unknown estimates or capacity are shown as unknown; a configured budget still fails closed when estimation is unavailable. Existing loaded models are reused without changing their context.
 
-### Download a new model explicitly
+### Load installed models only
 
-Downloading is separate from asking or loading. Ask Codex to call `pair_download_plan` with an exact LM Studio catalog ID or a Hugging Face repository URL, a device, and a destination to review. For a Hugging Face GGUF repository, pass `quantization` when needed. For a catalog ID or ambiguous/unreachable metadata, also supply a reviewed `estimated_size_bytes`. The plan has a one-use ID valid for ten minutes; `pair_download(plan_id, confirm_model)` requires the exact model ID again, and `pair_download_status` follows the job. No download starts while creating the plan.
-
-The plan can verify the size of **one unambiguous GGUF file** and its repository revision; it rechecks both before starting. That file size may differ from the complete LM Studio download. Bridge checks free space with 10% headroom only when the target device is local. The destination is supplied for review: LM Studio does not confirm that it is its configured model folder. For remote devices, verify both the actual folder and free space on that device before starting. [LM Studio download API](https://lmstudio.ai/docs/developer/rest/download).
-
-Devices are configured explicitly. PAIR peer discovery does not grant model-management access. Ollama lifecycle management, model deletion, engine installation, Unsloth model downloads, and PAIR cluster administration are not implemented. The separate `pair_download` tool is LM Studio-only, requires a one-use `pair_download_plan` and the exact model ID repeated in `confirm_model`; it is never used by `pair_ask` or `pair_smart_ask`.
+Bridge never downloads model files. Install weights through the engine outside Bridge. `pair_load` loads an installed model into RAM/VRAM. Download plan/start/status tools are disabled. Model loading has a total 180-second deadline; per-device `load_timeout_seconds` accepts 1..3600. On timeout the engine may still be loading: inspect before retrying.
 
 For an authenticated device, set `api_key_env` to the name of an environment variable containing its token and pass that variable to the MCP process through `.mcp.json` `env_vars`. Keep tokens out of configuration committed to Git and out of prompts.
 
@@ -300,10 +296,10 @@ Example arguments for `pair_ask` (replace the model ID):
 | `pair_ask` | `model`, `prompt`, optional `device`, `max_tokens` | Answer, selected model, completion status, timing and usage when available. |
 | `pair_smart_ask` | `prompt`; optional `model`, `device`, `task_hint` (`general`, `code`, `fast`, `long_context`, `analysis`), `context_length`, `max_tokens`, `unload_after` | Chooses from live installed device inventories, loads if needed, asks once and reports cleanup. No download or silent fallback. |
 | `pair_benchmark` / `pair_benchmark_results` | Exact loaded device/model, profile and 3–12 cases with `prompt` and literal `expected_contains` | Measures pass count and latency. Recent results influence smart routing; only metrics are saved. Use representative, reviewed cases. |
+| `pair_benchmark_suites` / `pair_benchmark_run` / `pair_benchmark_compare` | Nested smoke (6), short (20), full (100); exact already-loaded device/model | Background jobs, durable quality/speed/error metrics, RU/EN breakdowns and comparison table. Read runs with `pair_benchmark_results` without profile. [Consumer contract](docs/BENCHMARKS.md). |
 | `pair_job_start` / `pair_job_status` / `pair_job_cancel` / `pair_job_recover` | Exact device/model and prompt to start; job ID thereafter | Bounded background request with loading, prompt, response and cleanup stages, partial text, cancellation and journal-backed recovery metadata. |
 | `pair_compare` | `prompt`, two exact device/model pairs | Two sequential results with provenance and textual disagreements; Codex verifies claims against source. |
 | `pair_diagnose` | None | Router/device health and recent local request stages, durations, and sanitized failure reasons; no prompts or tokens. `request_journal_status` reports `ok`, `not_created`, `permission_denied`, or `unavailable`; journal access errors do not abort diagnosis. |
-| `pair_download_plan` / `pair_download` / `pair_download_status` | Exact model and destination; optional estimate for unknown sizes; one-use plan ID, repeated `confirm_model`; job ID | A Hugging Face repository link with an unambiguous GGUF file can provide independently checked file size/revision. Free space is checked with 10% headroom when the configured `models_path` matches the destination. Otherwise the actual storage path remains unverified. Catalog IDs require a caller-supplied estimate. LM Studio reports the job total only after starting. |
 | `pair_decide` / `pair_score` | State, Choice options or ordered Score levels, `allow_external=true` | Optional typed evaluation from **external** TypeSafe AI Jev; requires `TYPESAFE_API_KEY`. |
 
 The smart path requires at least one explicitly configured, online device. It preserves pre-existing loaded instances. An instance loaded for a successful smart request is unloaded by default; an inference error or timeout leaves it loaded for inspection. Other applications can use the same engine, so Bridge cannot guarantee an instance is idle outside its own calls. Set `unload_after=false` when sharing a model with other clients.
@@ -389,4 +385,7 @@ codex plugin marketplace remove pair-bridge
 
 Embeddings accept 1–32 nonblank texts, <=8192 characters each and <=48000 total. `expected_dimensions` checks rather than resizes vectors. Vision accepts 1–4 inline images, <=4 MiB decoded each and <=12 MiB total; it checks base64 and headers/containers, leaving pixel decoding to the engine. Files and remote image URLs are not read. Both tools require a loaded instance; use `pair_load` explicitly when needed.
 
-Batch IDs belong to this process; up to 64 groups and 512 jobs are retained. Old jobs may fall back to journal metadata without answers. Prompts, answers, schemas, images and vectors are not journalled. Existing ownership, device locks and benchmarks are preserved; benchmark expansion is deferred. [Full contracts, examples and limitations](docs/MCP_INFERENCE.md).
+Batch IDs belong to this process; up to 64 groups and 512 jobs are retained. Old jobs may fall back to journal metadata without answers. Prompts, answers, schemas, images and vectors are not journalled. Existing ownership and device locks are preserved. [Full contracts, examples and limitations](docs/MCP_INFERENCE.md).
+
+
+Portable Bridge-only configuration and recovery: [docs/BRIDGE_SETUP.md](docs/BRIDGE_SETUP.md).
