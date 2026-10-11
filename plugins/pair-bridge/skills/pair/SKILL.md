@@ -5,6 +5,12 @@ description: Use NVIDIA PAIR and configured LM Studio or Unsloth Studio devices 
 
 # PAIR
 
+For Swift on a configured Unsloth device, `pair_ask`, `pair_smart_ask`, `pair_job_start` and each batch member accept `enable_thinking=false`. Omit it (or use null) to preserve engine defaults; true enables thinking explicitly. Bridge checks the engine's fresh OpenAPI advertisement before inference/loading and rejects unsupported control without retry or fallback. Do not send thinking control through the PAIR router or to LM Studio.
+
+Before an inference, call `pair_model_capabilities(device, model, max_tokens=<planned budget>)` and inspect `output_budget.increase_request`. If the planned generation budget or known ceiling is below 40000 tokens, ask the user to increase `max_tokens` to 40000 or explicitly retain the smaller budget. If the known ceiling is below 40000, explain the limiting source and do not propose an impossible budget. Unknown ceilings remain unknown. Do not silently raise budgets or retry `empty_answer`.
+
+Inspect `output_budget.context_increase_request` separately. A loaded or planned context below 40000 requires asking the user to increase `context_length` to 40000 or keep the smaller context. A model maximum below 40000 cannot satisfy the target; unknown contexts remain unknown. Increasing a loaded context requires a separately authorized reload and fresh memory preflight. Ask about both low limits together. Raising context does not raise `max_tokens`, and raising `max_tokens` does not change context.
+
 Use `pair_model_capabilities(device, model)` for fresh model capabilities and context. Read each supported/unsupported/unknown status and its source; a model name is not proof of vision, embeddings or JSON Schema support. No inference probe or loading occurs. Missing metadata stays unknown.
 
 For structured answers, `pair_ask`, `pair_smart_ask`, `pair_job_start`, each batch member and `pair_vision_ask` accept either `json_schema` or OpenAI `response_format` (json_object/json_schema). Use inline draft 2020-12 schemas, <=32 KiB and <=24 nesting levels; schema references are unsupported. Unknown JSON Schema capability permits an explicit attempt; explicit unsupported metadata rejects it. Read `structured_output` only on validated success. Truncated/invalid/schema-mismatched output fails without retries. Structured jobs use OpenAI SSE. Never weaken the schema or silently retry to conceal a failure.

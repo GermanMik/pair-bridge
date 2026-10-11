@@ -35,7 +35,7 @@ from typing import Annotated
 import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from pydantic import Field, BaseModel, ConfigDict
+from pydantic import Field, BaseModel, ConfigDict, StrictBool
 
 def load_config() -> tuple[str, str | None]:
     path = Path.home() / '.pair-bridge.json'
@@ -460,6 +460,14 @@ def pair_list(device: str | None = None) -> dict:
                        'Use pair_smart_ask, or pair_load followed by pair_ask with the returned device; no download is required.')}
 
 
+def request_thinking_options(c, device, enable_thinking):
+    if enable_thinking is None:
+        return {}
+    engine = management.engine_for(device) if device is not None else None
+    schema = management.request(c, 'GET', '/openapi.json') if engine == 'unsloth' else None
+    return inference_io.thinking_options(enable_thinking, engine, schema)
+
+
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
 @diagnostics.traced
 def pair_ask(
@@ -469,6 +477,7 @@ def pair_ask(
     device: str | None = None,
     response_format: dict | None = None,
     json_schema: dict | None = None,
+    enable_thinking: StrictBool | None = None,
 ) -> dict:
     """Ask one explicitly selected PAIR chat model for a second opinion or bounded task.
 
@@ -493,6 +502,7 @@ def pair_ask(
             payload['response_format'] = fmt
         if device is not None:
             with management.client(device) as c:
+                payload.update(request_thinking_options(c, device, enable_thinking))
                 selected = management.find_model(c, model, device)
                 inference_io.require_structured(selected, fmt)
                 budget = inference_io.output_budget(selected, max_tokens)
@@ -505,6 +515,7 @@ def pair_ask(
                 diagnostics.stage('inference')
                 data = management.request(c, 'POST', '/v1/chat/completions', payload)
         else:
+            inference_io.thinking_options(enable_thinking, None)
             available = {item['id']: item for item in catalog()}
             if model not in available:
                 raise ValueError('Model is no longer advertised by PAIR. Refresh pair_list and use an exact ID.')
@@ -699,6 +710,7 @@ def pair_smart_ask(
     max_load_bytes: Annotated[int | None, Field(ge=1)] = None,
     response_format: dict | None = None,
     json_schema: dict | None = None,
+    enable_thinking: StrictBool | None = None,
 ) -> dict:
     """Select a memory-fit installed LLM unless one is explicit, load if needed, ask once, and clean up only a new instance.
 
@@ -706,6 +718,12 @@ def pair_smart_ask(
     Existing loaded instances are preserved. An ambiguous multi-instance model is not selected automatically.
     """
     fmt = inference_io.response_format(response_format, json_schema)
+    thinking = {}
+    if enable_thinking is not None:
+        if device is None:
+            raise ValueError('Explicit thinking control requires a configured Unsloth device')
+        with management.client(device) as control_client:
+            thinking = request_thinking_options(control_client, device, enable_thinking)
     if not prompt.strip():
         raise ValueError('prompt must not be blank')
     diagnostics.stage('inventory', device=device, model=model)
@@ -820,6 +838,7 @@ def pair_smart_ask(
                 payload = {'model': management.chat_model_id(selected_device, key, instances[0]['id']),
                            'messages': [{'role': 'user', 'content': prompt}],
                            'max_tokens': max_tokens, 'stream': False}
+                payload.update(thinking)
                 if fmt is not None:
                     payload['response_format'] = fmt
                 try:
@@ -873,7 +892,7 @@ def pair_smart_ask(
 
 
 async def _job_stream(job: jobs.Job, c: httpx.AsyncClient, instance_id: str, prompt: str, max_tokens: int,
-                      response_format: dict | None = None) -> str:
+                      response_format: dict | None = None, enable_thinking: bool | None = None) -> str:
     """Consume engine SSE; retain message text only, never reasoning/tool content."""
     if management.engine_for(job.device) == 'unsloth' or response_format is not None:
         payload = {'model': management.chat_model_id(job.device, job.model, instance_id),
@@ -881,6 +900,8 @@ async def _job_stream(job: jobs.Job, c: httpx.AsyncClient, instance_id: str, pro
                    'max_tokens': max_tokens, 'stream': True}
         if response_format is not None:
             payload['response_format'] = response_format
+        if enable_thinking is not None:
+            payload['enable_thinking'] = enable_thinking
         ended = False
         async with c.stream('POST', '/v1/chat/completions', json=payload) as response:
             if not response.is_success:
@@ -995,7 +1016,7 @@ async def _job_stream(job: jobs.Job, c: httpx.AsyncClient, instance_id: str, pro
 
 
 def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, unload_after: bool,
-             response_format: dict | None = None) -> None:
+             response_format: dict | None = None, enable_thinking: bool | None = None) -> None:
     owned_id = None
     try:
         with inference_lock(job.device, wait_seconds=30), management.client(job.device) as c:
@@ -1003,6 +1024,7 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
                 job.update(status='cancelled', stage='cancelled')
                 return
             job.update(status='running', stage='inventory')
+            request_thinking_options(c, job.device, enable_thinking)
             rows = management.models(c, job.device)
             selected = next((m for m in rows if m['key'] == job.model), None)
             if selected is None or selected.get('type') != 'llm':
@@ -1071,6 +1093,9 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
             async def stream_request():
                 async with httpx.AsyncClient(base_url=str(c.base_url), headers=c.headers,
                                              timeout=180, trust_env=False, follow_redirects=False) as stream_client:
+                    if enable_thinking is not None:
+                        return await _job_stream(job, stream_client, instance_id, prompt, max_tokens,
+                                                 response_format, enable_thinking)
                     if response_format is not None:
                         return await _job_stream(job, stream_client, instance_id, prompt, max_tokens, response_format)
                     return await _job_stream(job, stream_client, instance_id, prompt, max_tokens)
@@ -1133,7 +1158,7 @@ def pair_job_start(device: str, model: str, prompt: Annotated[str, Field(min_len
                    context_length: Annotated[int, Field(ge=512, le=262144)] = 8192,
                    max_tokens: Annotated[int, Field(ge=32)] = 2048,
                    unload_after: bool = True, response_format: dict | None = None,
-                   json_schema: dict | None = None) -> dict:
+                   json_schema: dict | None = None, enable_thinking: StrictBool | None = None) -> dict:
     """Start a background model job; different explicit PCs can run concurrently.
 
     Start every target before polling pair_job_status. Same-device jobs serialize
@@ -1144,6 +1169,13 @@ def pair_job_start(device: str, model: str, prompt: Annotated[str, Field(min_len
     fmt = inference_io.response_format(response_format, json_schema)
     if device not in management.devices() or not prompt.strip():
         raise ValueError('Use an exact configured device and nonblank prompt')
+    if enable_thinking is not None:
+        if type(enable_thinking) is not bool:
+            raise ValueError('enable_thinking must be a boolean or null')
+        if management.engine_for(device) != 'unsloth':
+            raise ValueError('Explicit thinking control requires a configured Unsloth device')
+        return jobs.create(device, model, _run_job, prompt, context_length, max_tokens,
+                           unload_after, fmt, enable_thinking)
     if fmt is not None:
         return jobs.create(device, model, _run_job, prompt, context_length, max_tokens, unload_after, fmt)
     return jobs.create(device, model, _run_job, prompt, context_length, max_tokens, unload_after)
@@ -1156,7 +1188,8 @@ def pair_job_status(job_id: str) -> dict:
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
-def pair_model_capabilities(device: str, model: str) -> dict:
+def pair_model_capabilities(device: str, model: str,
+                            max_tokens: Annotated[int | None, Field(ge=32)] = None) -> dict:
     """Inspect fresh engine model metadata without loading or probing inference.
 
     Unknown does not mean unsupported. LM Studio reports vision/tool training;
@@ -1164,7 +1197,17 @@ def pair_model_capabilities(device: str, model: str) -> dict:
     """
     with management.client(device) as c:
         item = management.find_model(c, model, device)
-    return dict(inference_io.model_capabilities(item, management.engine_for(device)), device=device)
+    result = dict(inference_io.model_capabilities(item, management.engine_for(device)), device=device)
+    budget = inference_io.output_budget(item)
+    if max_tokens is not None:
+        if not inference_io._positive_int(max_tokens) or max_tokens < 32:
+            raise ValueError('max_tokens must be an integer >= 32')
+        budget['requested_max_tokens'] = max_tokens
+        budget['increase_request'] = inference_io.token_increase_request(max_tokens, budget['known_ceiling'])
+        budget['request_within_known_ceiling'] = (max_tokens <= budget['known_ceiling']
+                                                  if budget['known_ceiling'] is not None else None)
+    result['output_budget'] = budget
+    return result
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
@@ -1190,6 +1233,7 @@ class BatchRequest(BaseModel):
     unload_after: bool = True
     response_format: dict | None = None
     json_schema: dict | None = None
+    enable_thinking: StrictBool | None = None
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))

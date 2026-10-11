@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.8.2 (unreleased)
+## 0.8.3
+
+- Add advertised per-request Unsloth `enable_thinking` control to direct asks, smart asks, jobs and batches; omitted values preserve engine defaults.
+- Report separate confirmation requests to increase generation `max_tokens` and loaded/planned `context_length` to 40000, respecting known model ceilings and requiring confirmation before changes or reloads.
+- Validate thinking transport, reasoning-only empty streams, independent budget thresholds, and batch forwarding; all 8 targeted regression tests pass.
+
+## 0.8.2
 
 - Add nested, versioned bilingual smoke (6), short (20) and full (100) benchmark suites, background runs, metrics-only history, comparisons and routing eligibility for compatible completed short/full runs.
 - Preserve exact loaded-instance targeting, cancellation, workload-aware comparisons, objective validators and no prompt/answer persistence; retain verified benchmark request and history fixes.

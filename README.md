@@ -168,6 +168,10 @@ If your endpoint requires a bearer token, set `PAIR_API_KEY` in that environment
 
 ## Configure managed devices
 
+On configured Unsloth devices, `pair_ask`, `pair_smart_ask`, `pair_job_start` and each batch member accept `enable_thinking=false` to disable thinking for models such as Swift. The engine must advertise this field in `/openapi.json`; omitted or null values preserve engine defaults. Explicit control is unavailable through the PAIR router and LM Studio.
+
+Before inference, inspect `pair_model_capabilities(device, model, max_tokens=<planned budget>)`. Its `output_budget.increase_request` and `output_budget.context_increase_request` report generation and loaded context thresholds independently at 40000 tokens. The context field also reflects a planned context when one is supplied to an inference preflight. Increase requests require user confirmation; known model ceilings below the target stay visible as limits, and unknown values remain unknown. Changing a loaded context needs an authorized reload and fresh memory preflight. Neither value changes automatically.
+
 Add LM Studio or Unsloth Studio API origins to the same configuration file. These are separate from the PAIR proxy URL:
 
 ```json

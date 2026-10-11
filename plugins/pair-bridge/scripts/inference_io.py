@@ -21,6 +21,62 @@ def _positive_int(value):
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def thinking_options(value, engine, schema=None):
+    """Explicit, advertised Unsloth request control; None preserves engine defaults."""
+    if value is None:
+        return {}
+    if type(value) is not bool:
+        raise ValueError('enable_thinking must be a boolean or null')
+    if engine != 'unsloth':
+        raise ValueError('Explicit thinking control requires a configured Unsloth device')
+    try:
+        field = schema['components']['schemas']['ChatCompletionRequest']['properties']['enable_thinking']
+    except (KeyError, TypeError):
+        raise ValueError('Engine does not advertise explicit thinking control') from None
+    if not isinstance(field, dict):
+        raise ValueError('Engine does not advertise explicit thinking control')
+    return {'enable_thinking': value}
+
+
+def token_increase_request(requested, ceiling):
+    """Advice only: never clamp, reload an instance or retry an inference."""
+    threshold = 40000
+    low = requested is not None and requested < threshold
+    constrained = ceiling is not None and ceiling < threshold
+    return {'threshold_tokens': threshold,
+            'status': 'limit_below_target' if constrained else ('confirmation_required' if low else 'not_needed'),
+            'requested_max_tokens': requested,
+            'proposed_max_tokens': threshold if low and not constrained else None,
+            'known_ceiling': ceiling,
+            'ceiling_verified': ceiling is not None,
+            'requires_confirmation': low or constrained,
+            'action': ('Inspect engine/model/context limits; 40000 is not currently supported by known limits.' if constrained
+                       else 'Ask the user to increase max_tokens to 40000, or explicitly keep the smaller budget.' if low
+                       else None)}
+
+
+def context_increase_request(item, planned=None):
+    """Separate loaded/planned context from the generation budget."""
+    instances = item.get('loaded_instances') or []
+    loaded = len(instances) == 1
+    actual = (instances[0].get('config') or {}).get('context_length') if loaded else planned
+    current = actual if _positive_int(actual) else None
+    maximum = item.get('max_context_length')
+    maximum = maximum if _positive_int(maximum) else None
+    constrained = maximum is not None and maximum < 40000
+    low = current is not None and current < 40000
+    needed = constrained or low
+    return {'threshold_tokens': 40000, 'current_context_length': current,
+            'context_source': 'loaded_instance.context_length' if loaded else 'requested_load.context_length' if current else 'not_reported',
+            'model_max_context_length': maximum,
+            'status': 'model_limit_below_target' if constrained else 'confirmation_required' if low else 'unknown' if current is None else 'not_needed',
+            'proposed_context_length': 40000 if low and not constrained else None,
+            'requires_confirmation': needed,
+            'reload_required': loaded and low and not constrained,
+            'action': 'The model maximum is below 40000; inspect a supported model/engine setting.' if constrained else
+                      'Ask the user to increase context_length to 40000 or keep the smaller context. Recheck memory before any authorized load/reload.' if low else None}
+
+
 def output_budget(item: dict, requested: int | None = None,
                   planned_context_length: int | None = None) -> dict:
     """Known ceilings only; the engine accounts for prompt/reasoning tokens."""
@@ -45,6 +101,8 @@ def output_budget(item: dict, requested: int | None = None,
             raise ValueError(f'Requested max_tokens={requested} exceeds known model/instance ceiling {upper}; inspect pair_model_capabilities')
     return {'requested_max_tokens': requested, 'known_ceiling': upper,
             'status': 'known' if limits else 'unknown', 'limits': limits,
+            'increase_request': token_increase_request(requested, upper),
+            'context_increase_request': context_increase_request(item, planned_context_length),
             'remaining_context': 'engine_validated_including_prompt_and_reasoning'}
 
 

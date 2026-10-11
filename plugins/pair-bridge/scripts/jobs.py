@@ -150,7 +150,8 @@ def create_batch(requests: list[dict], worker) -> dict:
             job.update(batch_id=batch_id)
             _jobs[job.id] = job
             pending.append((job, (request['prompt'], request['context_length'], request['max_tokens'],
-                                  request['unload_after'], request.get('response_format'))))
+                                  request['unload_after'], request.get('response_format')) +
+                                  ((request['enable_thinking'],) if request.get('enable_thinking') is not None else ())))
         _batches[batch_id] = [job.id for job, _ in pending]
         _prune()
         # Retain bounded group metadata; eviction does not cancel live workers.

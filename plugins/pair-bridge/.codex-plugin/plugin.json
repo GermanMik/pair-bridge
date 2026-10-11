@@ -1,6 +1,6 @@
 {
   "name": "pair-bridge",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "Use local models through PAIR with versioned benchmarks, bounded loading, installed-only model management, structured output and concurrent jobs.",
   "author": {
     "name": "GermanMik"
