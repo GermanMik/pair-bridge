@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 from mcp import ClientSession, StdioServerParameters
@@ -83,7 +84,8 @@ class BenchmarkProtocolTests(unittest.IsolatedAsyncioTestCase):
                             run = await call(session, 'pair_benchmark_run', device='fixture', model='model',
                                              suite='short', repeats=1, max_tokens=256)
                             run_ids.append(run['run_id'])
-                            for _ in range(100):
+                            deadline = time.monotonic() + 30
+                            while time.monotonic() < deadline:
                                 status = await call(session, 'pair_job_status', job_id=run['job_id'])
                                 if status['status'] in ('completed', 'failed', 'cancelled'):
                                     break

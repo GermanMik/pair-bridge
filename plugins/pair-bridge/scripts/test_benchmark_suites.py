@@ -412,7 +412,11 @@ class StreamTests(unittest.IsolatedAsyncioTestCase):
                   {'choices': [{'delta': {'content': '30'}}]},
                   {'choices': [{'delta': {}, 'finish_reason': 'stop'}]},
                   {'choices': [], 'usage': {'completion_tokens': 4}}]
-        row = await self.check_stream(events)
+        # MockTransport can finish within one Windows monotonic clock tick.
+        # Control only the runner's clock so throughput has a measured interval.
+        with patch.object(runner, 'time') as clock:
+            clock.monotonic.side_effect = [10.0, 10.1, 10.2]
+            row = await self.check_stream(events)
         self.assertEqual(row['answer'], '30')
         self.assertEqual(row['completion_tokens'], 4)
         self.assertGreaterEqual(row['ttft_ms'], 0)

@@ -18,23 +18,23 @@ class LoadDeadlineTests(unittest.TestCase):
                         try:
                             if mode=='headers':
                                 self.connection.sendall(b'HTTP/1.0 200 OK\r\nX-Padding: ')
-                                for _ in range(30):self.connection.sendall(b'x');time.sleep(.03)
+                                for _ in range(100):self.connection.sendall(b'x');time.sleep(.03)
                                 self.connection.sendall(b'\r\nContent-Length: 2\r\n\r\n{}')
                             else:
-                                self.send_response(200);self.send_header('Content-Length','32');self.end_headers()
-                                for _ in range(30):self.wfile.write(b' ');self.wfile.flush();time.sleep(.03)
+                                self.send_response(200);self.send_header('Content-Length','102');self.end_headers()
+                                for _ in range(100):self.wfile.write(b' ');self.wfile.flush();time.sleep(.03)
                                 self.wfile.write(b'{}');self.wfile.flush()
                         except (BrokenPipeError,ConnectionResetError,OSError):pass
                 engine=ThreadingHTTPServer(('127.0.0.1',0),Handler);engine.daemon_threads=True
                 thread=threading.Thread(target=engine.serve_forever,daemon=True);thread.start()
                 try:
-                    with tempfile.TemporaryDirectory() as tmp, patch.object(server,'user_cache_path',return_value=Path(tmp)), patch.object(management,'devices',return_value={'fixture':{'engine':'unsloth','load_timeout_seconds':.15}}):
+                    with tempfile.TemporaryDirectory() as tmp, patch.object(server,'user_cache_path',return_value=Path(tmp)), patch.object(management,'devices',return_value={'fixture':{'engine':'unsloth','load_timeout_seconds':1}}):
                         with httpx.Client(base_url=f'http://127.0.0.1:{engine.server_port}',headers={'Authorization':'Bearer fixture-token'},trust_env=False) as client:
                             start=time.monotonic()
                             with self.assertRaisesRegex(ValueError,'total deadline') as error:
                                 with server.inference_lock('fixture'):management.load_model(client,'fixture','fixture/model',8192)
                             elapsed=time.monotonic()-start
-                            self.assertLess(elapsed,1.5);self.assertEqual(diagnostics.reason(error.exception),'load_timeout')
+                            self.assertLess(elapsed,2.5);self.assertEqual(diagnostics.reason(error.exception),'load_timeout')
                             self.assertNotIn('fixture-token',str(error.exception))
                         code='import sys;from filelock import FileLock\nwith FileLock(sys.argv[1],timeout=0):pass'
                         result=subprocess.run([sys.executable,'-c',code,str(Path(tmp)/'device-fixture.lock')],capture_output=True,timeout=5)

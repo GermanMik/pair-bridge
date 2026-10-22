@@ -30,6 +30,8 @@ class ThinkingTests(unittest.TestCase):
     def test_sync_transport_exact_false_and_no_inference_when_unsupported(self):
         with tempfile.TemporaryDirectory() as temp, \
              patch.object(server, 'user_cache_path', return_value=Path(temp)), \
+             patch.object(server.management, 'devices', return_value={'unsloth': {'engine': 'unsloth'}}), \
+             patch.object(server.telemetry, 'sample', return_value=None), \
              patch.object(server.management, 'engine_for', return_value='unsloth'), \
              patch.object(server.management, 'client', return_value=contextlib.nullcontext(object())), \
              patch.object(server.management, 'find_model', return_value=ITEM), \
