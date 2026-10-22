@@ -6,6 +6,8 @@ This setup changes only PAIR Bridge. It does not require modifying or replacing 
 
 Edit the existing user-home `.pair-bridge.json`, preserving other keys and devices. Use the API origin shown by your engine. Ports below are examples, not discovery defaults. Do not point a direct device at the multi-host PAIR ingress: its catalog can contain other computers' models.
 
+For inference through NVIDIA PAIR 1.0, set the top-level `base_url` to the endpoint for the engine you want PAIR to route through. The LM Studio-compatible endpoint is commonly `http://127.0.0.1:1234/v1`; PAIR 1.0's llama.cpp OpenAI-compatible endpoint is commonly `http://127.0.0.1:8080/v1`. Confirm the actual URL in PAIR's **Endpoints** view; see NVIDIA's [Getting Started guide](https://docs.nvidia.com/local-ai/nvpair/getting-started) for current endpoint paths. Bridge supports inference and model listing through these OpenAI-compatible endpoints; it does not load or unload llama.cpp models. Keep configured `devices` for direct LM Studio/Unsloth management and per-device jobs.
+
 ```json
 {"devices":[{"id":"local-lmstudio","engine":"lmstudio","base_url":"http://127.0.0.1:1234"}]}
 ```
@@ -30,7 +32,7 @@ The existing native roster remains a fallback. A publisher that sends no usable 
 
 Run `pair_diagnose()` and `pair_devices()`. HTTP401/403 or missing authentication is reported as `online: null` with an authentication hint. It is not proof that the computer is offline. Connection failure has a separate status. Errors and discovery summaries exclude endpoint addresses, credentials and certificate bodies. Empty mDNS results alone do not identify a firewall fault. Check engine API availability, authentication mode, native pairing and wake state before changing network settings.
 
-`pair_list()` can return configured/native inventories when the router catalog has HTTP502/503, with sanitized router status. This read-only fallback does not retry failed inference or silently select another model. Request budgets retain the explicit value, including 16384; no new 8192 clamp is introduced.
+`pair_list()` can return configured/native inventories when the router catalog has HTTP502/503, with sanitized router status. This read-only fallback does not retry failed inference or silently select another model. Inference retries only an empty final answer, indefinitely on the same selected loaded instance; HTTP failures, timeouts and load errors are returned. Request budgets retain the explicit value, including 16384; no new 8192 clamp is introduced.
 
 Project-specific operational scripts and previous repair evidence are not a general installer. This change was tested with isolated stdio/HTTP/DNS fixtures and regression tests on Windows; macOS/Linux clean-install acceptance is not claimed. Distribution and publication are separate steps.
 

@@ -76,10 +76,93 @@ class BridgeTests(unittest.TestCase):
             self.assertEqual(result['answer'], 'answer')
             self.assertTrue(result['truncated'])
 
-    def test_empty_answer_is_failure(self):
-        with patch.object(server, 'catalog', return_value=[{'id': 'model', 'kind_hint': 'chat_candidate'}]), patch.object(server, 'request', return_value={'choices': [{'message': {'content': None, 'reasoning_content': 'private reasoning'}, 'finish_reason': 'length'}]}):
-            with self.assertRaisesRegex(ValueError, 'no final text'):
+    def test_empty_answer_retries_without_attempt_limit_and_preserves_request(self):
+        empty = {'choices': [{'message': {'content': None, 'reasoning_content': 'private reasoning'},
+                              'finish_reason': 'length'}]}
+        good = {'model': 'model', 'choices': [{'message': {'content': 'answer'}, 'finish_reason': 'stop'}]}
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(diagnostics, 'journal_path', return_value=Path(tmp) / 'requests.jsonl'), \
+             patch.object(server, 'catalog', return_value=[{'id': 'model', 'kind_hint': 'chat_candidate'}]), \
+             patch.object(server.time, 'sleep'), \
+             patch.object(server, 'request', side_effect=[empty] * 257 + [good]) as request_call:
+            # Exercise the unlimited retry primitive; public synchronous calls now
+            # hand the first empty completion to a cancellable job instead of timing out MCP.
+            invoke = lambda: server._request_nonempty_completion(
+                lambda: server.request('POST', '/chat/completions', {
+                    'model': 'model', 'messages': [{'role': 'user', 'content': 'same prompt'}],
+                    'max_tokens': 4096, 'stream': False}), 'model', None, server.time.monotonic())
+            invoke.__name__ = 'pair_ask'
+            invoke = diagnostics.traced(invoke)
+            result = invoke()
+            rows, status = diagnostics.recent_with_status()
+        self.assertEqual(result['answer'], 'answer')
+        self.assertEqual(result['empty_answer_retries'], 257)
+        self.assertEqual(request_call.call_count, 258)
+        self.assertTrue(all(call.args == ('POST', '/chat/completions', {
+            'model': 'model', 'messages': [{'role': 'user', 'content': 'same prompt'}],
+            'max_tokens': 4096, 'stream': False}) for call in request_call.call_args_list))
+        self.assertEqual(status, 'ok')
+        self.assertEqual(rows[-1]['status'], 'ok')
+        self.assertEqual(rows[-1]['empty_answer_retries'], 257)
+
+    def test_empty_answer_retry_does_not_retry_http_timeout_or_invalid_structured_output(self):
+        with patch.object(server, 'catalog', return_value=[{'id': 'model', 'kind_hint': 'chat_candidate'}]), \
+             patch.object(server.time, 'sleep') as sleep, \
+             patch.object(server, 'request', side_effect=ValueError('PAIR request timed out')) as request_call:
+            with self.assertRaisesRegex(ValueError, 'timed out'):
                 server.pair_ask('model', 'test')
+        self.assertEqual(request_call.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_job_empty_answer_retries_unlimited_and_cancellation_stops_loop(self):
+        attempts = 0
+
+        async def immediate_sleep(_delay):
+            return None
+
+        def run_without_event_loop(coroutine):
+            while True:
+                try:
+                    coroutine.send(None)
+                except StopIteration as completed:
+                    return completed.value
+
+        async def send_until_answer():
+            nonlocal attempts
+            attempts += 1
+            if attempts <= 251:
+                raise ValueError('Model returned no final text')
+            job.add_text('answer')
+            job.finish_reason = 'stop'
+            return 'answer'
+
+        with patch.object(server.jobs, '_append'), patch.object(server, '_empty_answer_retry_delay', return_value=0), \
+             patch.object(server.asyncio, 'sleep', new=immediate_sleep):
+            job = server.jobs.Job('pc', 'model')
+            job.update(status='running', stage='inference')
+            answer = run_without_event_loop(server._retry_job_empty_answer(job, send_until_answer))
+        self.assertEqual(answer, 'answer')
+        self.assertEqual(attempts, 252)
+        self.assertEqual(job.snapshot()['empty_answer_retries'], 251)
+
+        async def always_empty():
+            cancelled.cancel_event.set()
+            raise ValueError('Model returned no final text')
+        with patch.object(server.jobs, '_append'), patch.object(server, '_empty_answer_retry_delay', return_value=0), \
+             patch.object(server.asyncio, 'sleep', new=immediate_sleep):
+            cancelled = server.jobs.Job('pc', 'model')
+            with self.assertRaises(asyncio.CancelledError):
+                run_without_event_loop(server._retry_job_empty_answer(cancelled, always_empty))
+        self.assertEqual(cancelled.snapshot()['empty_answer_retries'], 1)
+
+        with patch.object(server, 'catalog', return_value=[{'id': 'model', 'kind_hint': 'chat_candidate'}]), \
+             patch.object(server.time, 'sleep') as sleep, \
+             patch.object(server, 'request', return_value={
+                 'choices': [{'message': {'content': 'not json'}, 'finish_reason': 'stop'}]}) as request_call:
+            with self.assertRaisesRegex(ValueError, 'invalid structured output'):
+                server.pair_ask('model', 'test', response_format={'type': 'json_object'})
+        self.assertEqual(request_call.call_count, 1)
+        sleep.assert_not_called()
 
     def test_diagnostic_journal_redacts_prompt_and_survives_partial_line(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(diagnostics, 'journal_path', return_value=Path(tmp) / 'requests.jsonl'), \
@@ -115,6 +198,32 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(server.select_model(rows)[1]['key'], 'warm')
         with self.assertRaisesRegex(ValueError, 'No suitable installed'):
             server.select_model(rows, model='gpt-oss-20b')
+
+    def test_smart_selection_reuses_loaded_before_ranked_cold_model(self):
+        cold = {'key': 'cold-ranked-first', 'type': 'llm', 'size_bytes': 1, 'loaded_instances': []}
+        warm = {'key': 'warm-loaded', 'type': 'llm', 'size_bytes': 99, 'loaded_instances': [{'id': 'warm-i'}]}
+        inventory = [{'device': 'pc', 'online': True, 'models': [cold, warm]}]
+        with patch.object(server, 'rank_models', return_value=[('pc', cold), ('pc', warm)]), \
+             patch.object(server.management, 'devices', return_value={'pc': {}}), \
+             patch.object(server.diagnostics, 'last_successful_model', return_value=None), \
+             patch.object(server.management, 'memory_preflight') as preflight:
+            device, model, memory, _released, rejected = server.select_model_for_memory(inventory, 8192, 'general')
+        self.assertEqual((device, model['key']), ('pc', 'warm-loaded'))
+        self.assertEqual(memory['selection_reason'], 'reused_loaded_model')
+        preflight.assert_not_called()
+
+    def test_smart_selection_tries_latest_success_before_cold_ranking(self):
+        first = {'key': 'ranked-first', 'type': 'llm', 'size_bytes': 1, 'loaded_instances': []}
+        last = {'key': 'last-success', 'type': 'llm', 'size_bytes': 99, 'loaded_instances': []}
+        inventory = [{'device': 'pc', 'online': True, 'models': [first, last]}]
+        with patch.object(server, 'rank_models', return_value=[('pc', first), ('pc', last)]), \
+             patch.object(server.management, 'devices', return_value={'pc': {}}), \
+             patch.object(server.diagnostics, 'last_successful_model', return_value={'device': 'pc', 'model': 'last-success'}), \
+             patch.object(server.management, 'memory_preflight', return_value={'status': 'estimated'}) as preflight:
+            device, model, memory, _released, rejected = server.select_model_for_memory(inventory, 8192, 'general')
+        self.assertEqual((device, model['key']), ('pc', 'last-success'))
+        self.assertEqual(memory['selection_reason'], 'last_successful_model')
+        self.assertEqual(preflight.call_args.args[2]['key'], 'last-success')
 
     def test_empty_router_catalog_falls_back_to_installed_devices(self):
         rows = [{'key': 'qwen', 'display_name': 'Qwen', 'type': 'llm', 'size_bytes': 10,
@@ -261,7 +370,7 @@ class BridgeTests(unittest.TestCase):
                  patch.object(server.management, 'preflight_for_load', return_value=prepared), \
                  patch.object(server.management, 'find_model', side_effect=[cold, warm] if mode == 'smart' else [warm]), \
                  patch.object(server.management, 'request', side_effect=native_reply), \
-                 patch.object(server, '_job_stream', new_callable=AsyncMock), \
+                 patch.object(server, '_job_stream', new_callable=AsyncMock, return_value='answer'), \
                  patch.object(server.management, 'unload_model') as unload:
                 client.return_value.__enter__.return_value = Mock(base_url='http://unsloth', headers={})
                 if mode == 'smart':
@@ -318,10 +427,12 @@ class BridgeTests(unittest.TestCase):
                  patch.object(server.management, 'devices', return_value={'pc': {}}), \
                  patch.object(server.management, 'engine_for', return_value='unsloth'), \
                  patch.object(server.management, 'models', return_value=[cold]), \
-                 patch.object(server.management, 'preflight_for_load', return_value={'candidate': cold, 'auto_unloaded_instances': []}), \
+                 patch.object(server.management, 'preflight_for_load', return_value={
+                     'candidate': cold, 'memory': {'status': 'estimated'}, 'auto_unloaded_instances': []}), \
                  patch.object(server.management, 'load_with_auto_unload', return_value={'result': {'status': status}, 'auto_unloaded_instances': []}), \
                  patch.object(server.management, 'find_model', return_value=warm), \
-                 patch.object(server, '_job_stream', new_callable=AsyncMock) as stream, \
+                 patch.object(server.management, 'validate_runtime_capacity', return_value={'status': 'warning', 'warnings': ['test telemetry unavailable']}), \
+                 patch.object(server, '_job_stream', new_callable=AsyncMock, return_value='answer') as stream, \
                  patch.object(server.management, 'unload_model') as unload:
                 client.return_value.__enter__.return_value = Mock(base_url='http://unsloth', headers={})
                 job = jobs.Job('pc', 'candidate')
@@ -665,7 +776,8 @@ class ProtocolTests(unittest.IsolatedAsyncioTestCase):
                                                           'pair_benchmark_suites', 'pair_benchmark_run', 'pair_benchmark_compare',
                                                           'pair_job_start', 'pair_job_status', 'pair_job_cancel', 'pair_job_recover',
                                                           'pair_model_capabilities', 'pair_job_list', 'pair_batch_start', 'pair_batch_status',
-                                                          'pair_batch_cancel', 'pair_embeddings', 'pair_vision_ask'})
+                                                          'pair_batch_cancel', 'pair_embeddings', 'pair_vision_ask',
+                                                          'pair_logs', 'pair_logs_export', 'pair_job_reconfigure'})
                 capability = next(t for t in tools if t.name == 'pair_capabilities')
                 self.assertTrue(capability.annotations.readOnlyHint)
                 self.assertIn('different explicit PCs can run concurrently', next(t for t in tools if t.name == 'pair_job_start').description)

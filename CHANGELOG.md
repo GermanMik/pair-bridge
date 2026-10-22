@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.4
+
+- Preserve per-attempt finish/usage/reasoning-presence evidence, distinguish tool/refusal/transport failures, and expose the running version and source build.
+- Hand empty synchronous answers to cancellable jobs; retain unlimited retries, wait for explicit budget/thinking changes after exhaustion, and recheck target and memory before retries.
+- Add `pair_job_reconfigure` with explicit local recovery profiles and prompt/context budget validation; export safe attempt evidence with final outcomes.
+
+- Document NVIDIA PAIR 1.0 engine-specific OpenAI endpoints, including llama.cpp, and clarify that llama.cpp model lifecycle remains managed by PAIR.
+- Retry confirmed empty final answers without a retry-count limit on the same request and model instance; expose retry progress and keep cancellation for background jobs.
+- Add local answer/error logs with safe export, prefer resident models and then the latest successful model, and warn when Bridge cannot verify a cold-load memory estimate or fresh capacity.
+- Require a measured 1 GiB reserve for system RAM and NVIDIA VRAM during cold-load preflight; keep model work available with a warning when capacity telemetry is unknown.
+
 ## 0.8.3
 
 - Add advertised per-request Unsloth `enable_thinking` control to direct asks, smart asks, jobs and batches; omitted values preserve engine defaults.

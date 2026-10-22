@@ -9,6 +9,7 @@ import time
 import uuid
 
 from platformdirs import user_cache_path
+import diagnostics
 
 
 _lock = threading.RLock()
@@ -60,7 +61,20 @@ class Job:
         self.finish_reason = None
         self.output_truncated = False
         self.output_budget = None
+        self.memory_preflight = None
+        self.empty_answer_retries = 0
+        self.attempt_metadata = {}
+        self.next_retry_at = None
+        self.recovery_advice = None
+        self.recovery_parameters = {}
+        self.recovery_revision = 0
+        self.recovery_wait_revision = None
+        self.recovery_target_instance = None
+        self.recovery_initial_preflight = False
+        self.recovery_unpinned = False
+        self.recovery_device = None
         self._last_persist = 0.0
+        self._outcome_logged = False
         self.update()
 
     def snapshot(self) -> dict:
@@ -78,6 +92,13 @@ class Job:
                     'finish_reason': self.finish_reason,
                     'output_truncated': self.output_truncated,
                     'output_budget': self.output_budget,
+                    'memory_preflight': self.memory_preflight,
+                    'empty_answer_retries': self.empty_answer_retries,
+                    'attempt_metadata': self.attempt_metadata,
+                    'next_retry_at': self.next_retry_at,
+                    'recovery_advice': self.recovery_advice,
+                    'recovery_parameters': dict(self.recovery_parameters),
+                    'recovery_revision': self.recovery_revision,
                     'partial_answer': self.answer[-4000:] if self.status in ('running', 'cancel_requested') else None}
 
     def update(self, **changes) -> None:
@@ -102,6 +123,27 @@ class Job:
                 _append(row)
             except OSError:
                 pass
+            if self.status in TERMINAL and not self._outcome_logged:
+                outcome = {'timestamp': self.updated_at, 'request_id': self.id,
+                           'operation': 'pair_job', 'device': self.device, 'model': self.model,
+                           'status': 'completed' if self.status == 'completed' else self.status,
+                           'empty_answer_retries': self.empty_answer_retries}
+                outcome['attempt_metadata'] = self.attempt_metadata
+                if self.status == 'completed':
+                    if self.answer:
+                        outcome['answer'] = self.answer[:48000]
+                    if self.structured_output is not None:
+                        outcome['structured_output'] = self.structured_output
+                    if isinstance(self.finish_reason, str):
+                        outcome['finish_reason'] = self.finish_reason[:128]
+                elif self.status == 'failed':
+                    outcome['error_code'] = self.error_code or 'request_failed'
+                    outcome['error'] = diagnostics.safe_error(outcome['error_code'])
+                try:
+                    diagnostics.record_outcome(outcome)
+                except (OSError, TypeError, ValueError):
+                    pass
+                self._outcome_logged = True
 
     def add_text(self, text: str) -> None:
         with self.lock:

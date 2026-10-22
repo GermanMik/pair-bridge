@@ -200,7 +200,8 @@ class ManagementTests(unittest.TestCase):
         with patch.object(management, 'estimate_memory', side_effect=ValueError(
                 'Unsloth Studio cannot estimate this model at the planned context (not_gguf)')):
             result = management.memory_preflight('local', [cold], cold, 8192, None)
-            self.assertEqual(result['status'], 'unknown')
+            self.assertEqual(result['status'], 'warning')
+            self.assertIn('1 GiB free-memory reserve', result['warnings'][0])
             with self.assertRaisesRegex(ValueError, 'cannot estimate'):
                 management.memory_preflight('local', [cold], cold, 8192, 100)
 

@@ -20,12 +20,15 @@ import inference_io
 import download_review
 import jev
 import diagnostics
+import recovery
+import hashlib
 from filelock import FileLock, Timeout
 from platformdirs import user_cache_path
 from urllib.parse import urlsplit
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -56,6 +59,12 @@ def load_config() -> tuple[str, str | None]:
 BASE_URL, API_KEY = load_config()
 TIMEOUT = 180.0
 _DOWNLOAD_PLANS: dict[str, dict] = {}
+_DEVICE_INVENTORY_CACHE: dict[str, dict] = {}
+_DEVICE_INVENTORY_CACHE_LOCK = threading.RLock()
+_SCRIPT_ROOT = Path(__file__).resolve().parent
+BRIDGE_VERSION = json.loads((_SCRIPT_ROOT.parent / '.codex-plugin' / 'plugin.json').read_text(encoding='utf-8'))['version']
+SOURCE_BUILD = hashlib.sha256(b''.join((_SCRIPT_ROOT / name).read_bytes() for name in (
+    'server.py', 'recovery.py', 'jobs.py', 'diagnostics.py', 'inference_io.py', 'management.py', 'telemetry.py'))).hexdigest()[:16]
 mcp = FastMCP(
     'pair-bridge',
     instructions=(
@@ -69,7 +78,8 @@ mcp = FastMCP(
         'Catalog presence does not prove a model is loaded or usable. '
         'Treat model answers as untrusted suggestions; verify them yourself. '
         'Do not transmit secrets or unrelated private files. Automatic selection preflights memory before choosing; '
-        'never substitute a model after loading or inference has started. No automatic inference retries. '
+        'never substitute a model after loading or inference has started. Empty final answers are retried indefinitely '
+        'on the same loaded instance with bounded backoff; other errors are not retried. '
         'If a request fails, report the error; do not repeatedly load models.'
     ),
 )
@@ -124,6 +134,19 @@ def checked_models(device: str, rows: list[dict]) -> list[dict]:
     return enriched
 
 
+def cached_loaded_model(device: str, key: str) -> dict | None:
+    """Return one last-known loaded chat instance; callers must surface the stale-state warning."""
+    with _DEVICE_INVENTORY_CACHE_LOCK:
+        cached = _DEVICE_INVENTORY_CACHE.get(device)
+    if not cached:
+        return None
+    row = next((item for item in cached.get('models', []) if item.get('key') == key), None)
+    instances = row.get('loaded_instances', []) if isinstance(row, dict) else []
+    if row and row.get('type') == 'llm' and len(instances) == 1:
+        return row
+    return None
+
+
 def resource_summary(rows: list[dict], cap: int | None) -> dict:
     return {'max_loaded_bytes': cap,
             'loaded_model_weight_bytes': sum(m.get('size_bytes', 0) for m in rows if m['loaded_instances']),
@@ -133,21 +156,155 @@ def resource_summary(rows: list[dict], cap: int | None) -> dict:
 def completion(data: dict, requested_model: str, device: str | None, started: float) -> dict:
     choices = data.get('choices')
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        raise ValueError('Model returned no completion choices.')
+        raise recovery.InferenceFailure('invalid_response')
     choice = choices[0]
-    message = choice.get('message') or {}
-    content = message.get('content') if isinstance(message, dict) else None
-    if isinstance(content, list):
-        content = '\n'.join(p['text'] for p in content if isinstance(p, dict) and isinstance(p.get('text'), str))
-    if not isinstance(content, str) or not content.strip():
-        raise ValueError('Model returned no final text (possibly exhausted its reasoning token budget). No automatic retry was made.')
+    message = choice.get('message')
+    if not isinstance(message, dict):
+        raise recovery.InferenceFailure('invalid_response', recovery.metadata(choice.get('finish_reason'), data.get('usage')))
+    finish_reason = choice.get('finish_reason')
+    if finish_reason is not None and not isinstance(finish_reason, str):
+        raise recovery.InferenceFailure('invalid_response')
+    reasoning = message.get('reasoning_content', message.get('reasoning', '')) if isinstance(message, dict) else ''
+    metadata = recovery.metadata(finish_reason, data.get('usage'),
+                                 len(reasoning) if isinstance(reasoning, str) else 0)
+    try:
+        content, content_reasoning, special = recovery.content_text(message.get('content'))
+    except recovery.InferenceFailure as exc:
+        raise recovery.InferenceFailure(exc.code, metadata) from None
+    if content_reasoning:
+        metadata = recovery.metadata(finish_reason, data.get('usage'), metadata['reasoning_characters'] + content_reasoning)
+    recovery.check_final(content, metadata, dict(message, **special))
     return {
         'device': device, 'route': 'direct_engine' if device else 'pair_router',
         'requested_model': requested_model, 'reported_model': data.get('model'),
         'answer': content, 'finish_reason': choice.get('finish_reason'),
         'truncated': choice.get('finish_reason') == 'length',
-        'elapsed_seconds': round(time.monotonic() - started, 2), 'usage': data.get('usage'),
+        'elapsed_seconds': round(time.monotonic() - started, 2), 'usage': recovery.safe_usage(data.get('usage')),
+        'attempt_metadata': metadata,
     }
+
+
+def _empty_answer_retry_delay(attempt: int) -> float:
+    """Back off to at most 30s; retry count itself is deliberately unbounded."""
+    return recovery.delay(attempt)
+
+
+def _request_nonempty_completion(send_request, model: str, device: str | None, started: float,
+                                 response_format: dict | None = None, on_empty=None) -> dict:
+    """Retry only empty final text, preserving this exact request and target indefinitely."""
+    retries = 0
+    while True:
+        data = send_request()
+        try:
+            result = inference_io.validate_completion(completion(data, model, device, started), response_format)
+        except ValueError as exc:
+            if diagnostics.reason(exc) != 'empty_answer':
+                raise
+            retries += 1
+            metadata = dict(getattr(exc, 'metadata', {}), attempt=retries)
+            diagnostics.record_attempt(uuid.uuid4().hex, device, model, metadata, retries)
+            diagnostics.note_empty_answer_retry(retries)
+            if on_empty is not None:
+                return on_empty(metadata)
+            time.sleep(_empty_answer_retry_delay(retries))
+            continue
+        result['empty_answer_retries'] = retries
+        return result
+
+
+def _recovery_preflight(c, device, model, instance_id):
+    """Read-only checks for each retry; never load or substitute an instance."""
+    if device is None:
+        raise recovery.InferenceFailure('target_changed')
+    warnings = []
+    try:
+        row = management.find_model(c, model, device)
+    except ValueError:
+        warnings.append('Live inventory is unconfirmed; attempting the original instance with a warning.')
+    else:
+        instances = row.get('loaded_instances', [])
+        if row.get('type') != 'llm' or len(instances) != 1 or instances[0].get('id') != instance_id:
+            raise recovery.InferenceFailure('target_changed')
+    config = management.devices().get(device)
+    if config is None:
+        raise recovery.InferenceFailure('target_changed')
+    capacity = management.validate_runtime_capacity(telemetry.sample(config), require_gpu=True)
+    return dict(capacity, warnings=[*warnings, *capacity.get('warnings', [])],
+                status='warning' if warnings or capacity.get('status') == 'warning' else 'ok')
+
+
+def _start_completion_recovery(model, device, payload, fmt, instance_id, metadata):
+    metadata = recovery.safe_metadata(dict(metadata, **{k: payload[k] for k in ('max_tokens', 'enable_thinking') if k in payload}))
+    if recovery.budget_exhausted(metadata):
+        metadata['cause'] = 'budget_exhausted'
+    pending = jobs.create(device or 'pair-router', model, _run_completion_recovery,
+                          device, dict(payload), fmt, instance_id, metadata)
+    return {'status': 'recovering', 'job_id': pending['job_id'], 'device': device,
+            'requested_model': model, 'empty_answer_retries': 1,
+            'attempt_metadata': recovery.safe_metadata(metadata),
+            'notice': 'Use pair_job_status, pair_job_reconfigure and pair_job_cancel. Retry attempts have no limit.'}
+
+
+def _run_completion_recovery(job, device, payload, fmt, instance_id, metadata):
+    """Continue a synchronous empty completion as an observable cancellable job."""
+    job.recovery_initial_preflight = True
+    job.recovery_unpinned = device is None
+    job.recovery_device = device
+    job.recovery_target_instance = instance_id
+    job.recovery_parameters = {k: payload[k] for k in ('max_tokens', 'enable_thinking') if k in payload}
+    job.update(empty_answer_retries=1, attempt_metadata=metadata, instance_id=instance_id)
+    diagnostics.record_attempt(job.id, job.device, job.model, metadata, 1)
+    if recovery.budget_exhausted(metadata):
+        job.recovery_wait_revision = job.recovery_revision
+    loop = None
+    try:
+        job.update(status='running', stage='queue')
+        def preflight():
+            with job.lock:
+                selected_device, selected_instance = job.recovery_device, job.instance_id
+            with management.client(selected_device) as c:
+                return _recovery_preflight(c, selected_device, job.model, selected_instance)
+        async def send():
+            with job.lock:
+                selected_device = job.recovery_device
+                current = dict(payload, **job.recovery_parameters)
+                selected_instance = job.instance_id
+            # Release the per-device lock while waiting; recheck after acquiring it
+            # so another client cannot make the earlier capacity snapshot authoritative.
+            with inference_lock(selected_device, wait_seconds=30), management.client(selected_device) as c:
+                capacity = _recovery_preflight(c, selected_device, job.model, selected_instance)
+                job.update(memory_preflight=capacity)
+                current['model'] = management.chat_model_id(selected_device, job.model, selected_instance)
+                if job.cancel_event.is_set():
+                    raise asyncio.CancelledError()
+                data = management.request(c, 'POST', '/v1/chat/completions', current)
+            row = inference_io.validate_completion(completion(data, job.model, selected_device, time.monotonic()), fmt)
+            job.answer = row['answer']
+            job.finish_reason = row['finish_reason']
+            job.output_truncated = row['truncated']
+            job.structured_output = row.get('structured_output')
+            job.attempt_metadata = row['attempt_metadata']
+            return job.answer
+        loop = asyncio.new_event_loop()
+        task = loop.create_task(_retry_job_empty_answer(job, send, preflight))
+        with job.lock:
+            job.loop, job.task = loop, task
+        loop.run_until_complete(task)
+        if job.cancel_event.is_set():
+            raise asyncio.CancelledError()
+        job.update(status='completed', stage='completed', cleanup='existing_instance_preserved')
+    except asyncio.CancelledError:
+        job.update(status='cancelled', stage='cancelled')
+    except Exception as exc:
+        job.update(status='cancelled' if job.cancel_event.is_set() else 'failed', stage='failed',
+                   error_code=diagnostics.reason(exc),
+                   attempt_metadata=getattr(exc, 'metadata', job.attempt_metadata))
+    finally:
+        with job.lock:
+            job.loop, job.task = None, None
+        if loop is not None:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
 
 
 def rank_models(inventory: list[dict], model: str | None = None, device: str | None = None,
@@ -156,7 +313,8 @@ def rank_models(inventory: list[dict], model: str | None = None, device: str | N
     """Return installed LLMs in deterministic preference order."""
     candidates = []
     for row in inventory:
-        if not row.get('online') or (device is not None and row.get('device') != device):
+        if (row.get('online') is not True and row.get('availability') != 'unknown') or \
+                (device is not None and row.get('device') != device):
             continue
         for item in row.get('models', []):
             if item.get('type') != 'llm' or (model is not None and item.get('key') != model):
@@ -221,10 +379,22 @@ def _validate_smart_candidate(item: dict, context_length: int, max_tokens: int |
 
 def select_model_for_memory(inventory: list[dict], context_length: int, task_hint: str,
                             max_load_bytes: int | None = None,
-                            device: str | None = None, max_tokens: int | None = None) -> tuple[str, dict, dict, list[dict]]:
+                            device: str | None = None, max_tokens: int | None = None) -> tuple[str, dict, dict, list[dict], list[str]]:
     """Choose the highest-ranked model that passes preflight, then try configured evictions."""
     ranked = rank_models(inventory, device=device, context_length=context_length, task_hint=task_hint,
                          max_load_bytes=max_load_bytes)
+    resident = [candidate for candidate in ranked if candidate[1].get('loaded_instances')]
+    cold = [candidate for candidate in ranked if not candidate[1].get('loaded_instances')]
+    ranked = resident + cold
+    last_success = diagnostics.last_successful_model(device=device)
+    if last_success is None and device is not None:
+        last_success = diagnostics.last_successful_model()
+    last_candidate = next((candidate for candidate in cold
+                           if last_success and (last_success.get('device') is None
+                                                or candidate[0] == last_success.get('device'))
+                           and candidate[1].get('key') == last_success.get('model')), None)
+    if last_candidate is not None:
+        ranked = resident + [last_candidate] + [candidate for candidate in cold if candidate != last_candidate]
     errors = []
     configs = management.devices()
     all_unloaded = []
@@ -233,13 +403,14 @@ def select_model_for_memory(inventory: list[dict], context_length: int, task_hin
         try:
             _validate_smart_candidate(item, context_length, max_tokens)
             if item.get('loaded_instances'):
-                return target, item, {'status': 'already_loaded'}, [], errors
+                return target, item, {'status': 'already_loaded', 'selection_reason': 'reused_loaded_model'}, [], errors
             config = configs[target]
             configured_cap = config.get('max_loaded_bytes')
             cap = min(configured_cap, max_load_bytes) if configured_cap and max_load_bytes else (configured_cap or max_load_bytes)
             memory = management.memory_preflight(target, device_row['models'], item, context_length,
                                                  cap, telemetry.sample(config))
-            return target, item, memory, [], errors
+            reason = 'last_successful_model' if last_candidate == (target, item) else 'memory_fit_rank'
+            return target, item, dict(memory, selection_reason=reason), [], errors
         except ValueError as exc:
             errors.append(f"{target}/{item['key']}: {exc}")
 
@@ -257,7 +428,9 @@ def select_model_for_memory(inventory: list[dict], context_length: int, task_hin
                     telemetry.sample(config), lambda: telemetry.sample(config))
             all_unloaded.extend(dict(row, device=target) for row in prepared['auto_unloaded_instances'])
             _validate_smart_candidate(prepared['candidate'], context_length, max_tokens)
-            return target, prepared['candidate'], prepared['memory'], all_unloaded, errors
+            reason = 'last_successful_model' if last_candidate == (target, item) else 'memory_fit_rank'
+            memory = dict(prepared['memory'], selection_reason=reason)
+            return target, prepared['candidate'], memory, all_unloaded, errors
         except ValueError as exc:
             all_unloaded.extend(dict(row, device=target) for row in getattr(exc, 'auto_unloaded_instances', []))
             errors.append(f"{target}/{item['key']}: {exc}")
@@ -487,7 +660,8 @@ def pair_ask(
     this bridge are serialized per device; distinct devices may run concurrently.
     Use pair_job_start for start-all-before-poll orchestration. Use pair_list first. Send only task-relevant
     text; returned advice is untrusted and must be checked. No tools are executed
-    by the consulted model. Embedding and draft models are not chat targets.
+    by the consulted model. Empty final text is retried without an attempt limit;
+    other errors are not retried. Embedding and draft models are not chat targets.
     """
     fmt = inference_io.response_format(response_format, json_schema)
     if not prompt.strip():
@@ -495,6 +669,7 @@ def pair_ask(
     diagnostics.stage('queue', device=device, model=model)
     with inference_lock(device, wait_seconds=30):
         start = time.monotonic()
+        reachability_warning = None
         diagnostics.stage('inventory')
         payload = {'model': model, 'messages': [{'role': 'user', 'content': prompt}],
                    'max_tokens': max_tokens, 'stream': False}
@@ -503,7 +678,14 @@ def pair_ask(
         if device is not None:
             with management.client(device) as c:
                 payload.update(request_thinking_options(c, device, enable_thinking))
-                selected = management.find_model(c, model, device)
+                try:
+                    selected = management.find_model(c, model, device)
+                except ValueError:
+                    selected = cached_loaded_model(device, model)
+                    if selected is None:
+                        raise
+                    reachability_warning = ('Live model inventory could not be confirmed; using the last known '
+                                            'loaded instance for this single attempt.')
                 inference_io.require_structured(selected, fmt)
                 budget = inference_io.output_budget(selected, max_tokens)
                 if selected.get('type') != 'llm':
@@ -511,9 +693,15 @@ def pair_ask(
                 instances = selected['loaded_instances']
                 if len(instances) != 1:
                     raise ValueError('Device chat requires exactly one loaded instance. Use pair_load or resolve multiple instances first')
+                memory_check = management.validate_runtime_capacity(
+                    telemetry.sample(management.devices()[device]), require_gpu=True)
                 payload['model'] = management.chat_model_id(device, model, instances[0]['id'])
                 diagnostics.stage('inference')
-                data = management.request(c, 'POST', '/v1/chat/completions', payload)
+                result = _request_nonempty_completion(
+                    lambda: management.request(c, 'POST', '/v1/chat/completions', payload),
+                    model, device, start, fmt,
+                    on_empty=lambda metadata: _start_completion_recovery(
+                        model, device, payload, fmt, instances[0]['id'], metadata))
         else:
             inference_io.thinking_options(enable_thinking, None)
             available = {item['id']: item for item in catalog()}
@@ -523,9 +711,16 @@ def pair_ask(
                 raise ValueError('This appears to be an embedding or draft model, not a chat model.')
             budget = inference_io.output_budget(available[model], max_tokens)
             diagnostics.stage('inference')
-            data = request('POST', '/chat/completions', payload)
+            result = _request_nonempty_completion(
+                lambda: request('POST', '/chat/completions', payload), model, device, start, fmt,
+                on_empty=lambda metadata: _start_completion_recovery(model, None, payload, fmt, None, metadata))
         diagnostics.stage('validation')
-        return dict(inference_io.validate_completion(completion(data, model, device, start), fmt), output_budget=budget)
+        result = dict(result, output_budget=budget)
+        if device is not None:
+            result['memory_preflight'] = memory_check
+        if reachability_warning:
+            result['reachability_warnings'] = [reachability_warning]
+        return result
 
 
 
@@ -537,6 +732,13 @@ def pair_capabilities() -> dict:
     while background inference overlaps. This is not distributed inference of one model.
     """
     return {
+        'bridge_version': BRIDGE_VERSION,
+        'source_build': SOURCE_BUILD,
+        'empty_answer_recovery': {'attempt_limit': None, 'backoff_max_seconds': 30,
+                                  'budget_exhaustion': 'wait_for_explicit_reconfiguration',
+                                  'sync_handoff': 'job_id', 'reconfigure_tool': 'pair_job_reconfigure',
+                                  'fresh_retry_preflight': True},
+        'result_logs': ['pair_logs', 'pair_logs_export'],
         'model_downloads_supported': False,
         'model_loading': 'installed models into RAM/VRAM only',
         'cross_device_parallel_jobs': True,
@@ -576,16 +778,29 @@ def pair_devices() -> dict:
         try:
             with management.client(name) as c:
                 models = management.models(c, name)
+                enriched = checked_models(name, models)
                 result.append({'device': name, 'online': True,
                                'checked_at': datetime.now(timezone.utc).isoformat(),
-                               'models': checked_models(name, models),
+                               'models': enriched,
                                'resources': resource_summary(models, config.get('max_loaded_bytes')),
                                'capacity': telemetry.sample(config)})
+                with _DEVICE_INVENTORY_CACHE_LOCK:
+                    _DEVICE_INVENTORY_CACHE[name] = {'checked_at': datetime.now(timezone.utc).isoformat(),
+                                                     'models': enriched}
         except ValueError as exc:
             failure = diagnostics.device_failure(exc)
-            result.append({'device': name, 'checked_at': datetime.now(timezone.utc).isoformat(),
-                           'check_status': 'authentication_required' if failure.get('auth_status') else ('unreachable' if failure['online'] is False else 'inspection_failed'),
-                           **failure})
+            with _DEVICE_INVENTORY_CACHE_LOCK:
+                cached = _DEVICE_INVENTORY_CACHE.get(name)
+            if cached:
+                result.append({'device': name, 'online': None, 'availability': 'unknown',
+                               'reachability_warning': 'Live inventory check failed; using the last known installed-model inventory. The selected device will be rechecked before inference.',
+                               'checked_at': cached['checked_at'], 'models': cached['models'],
+                               'capacity': {'status': 'partial', 'reason': 'Live device inventory unavailable'},
+                               'last_check_error': failure.get('reason', 'inspection_failed')})
+            else:
+                result.append({'device': name, 'checked_at': datetime.now(timezone.utc).isoformat(),
+                               'check_status': 'authentication_required' if failure.get('auth_status') else ('unreachable' if failure['online'] is False else 'inspection_failed'),
+                               **failure})
     cluster = cluster_inventory.inspect()
     return {'devices': result + cluster['nodes'], 'cluster_inventory_status': cluster['status'],
             'capabilities': pair_capabilities(), 'notice': cluster['notice']}
@@ -597,8 +812,10 @@ def pair_load(device: str, model: str,
               context_length: Annotated[int, Field(ge=512, le=262144)] = 8192) -> dict:
     """Load an installed model on one device into RAM/VRAM; never download weights.
 
-    Reuses existing loaded instances without changing their configuration. May
-    consume substantial memory or trigger engine auto-eviction. Verify the result.
+    Reuses existing loaded instances without changing their configuration. Cold
+    loads use an engine estimate and fresh Bridge RAM/VRAM telemetry when available,
+    preserving a 1 GiB free reserve. Unknown telemetry is returned as a warning.
+    May trigger engine auto-eviction; verify the result.
     """
     diagnostics.stage('queue', device=device, model=model)
     with inference_lock(device, wait_seconds=30), management.client(device) as c:
@@ -712,10 +929,11 @@ def pair_smart_ask(
     json_schema: dict | None = None,
     enable_thinking: StrictBool | None = None,
 ) -> dict:
-    """Select a memory-fit installed LLM unless one is explicit, load if needed, ask once, and clean up only a new instance.
+    """Select a memory-fit installed LLM unless one is explicit; retry empty answers on the same instance.
 
     No model downloads. Automatic selection checks memory before choosing; an explicit model is never substituted.
-    Existing loaded instances are preserved. An ambiguous multi-instance model is not selected automatically.
+    Existing loaded instances are preserved. Cold-load preflight and telemetry warnings are returned in
+    memory_preflight. An ambiguous multi-instance model is not selected automatically.
     """
     fmt = inference_io.response_format(response_format, json_schema)
     thinking = {}
@@ -734,14 +952,17 @@ def pair_smart_ask(
         router_models = set()
         router_status = 'unavailable'
     snapshot = pair_devices()
+    reachability_warnings = [f"{row['device']}: {row['reachability_warning']}" for row in snapshot['devices']
+                             if row.get('reachability_warning')]
     preselected_unloaded = []
     memory_rejections = []
     if model is None:
-        selected_device, selected, _selection_memory, preselected_unloaded, memory_rejections = select_model_for_memory(
+        selected_device, selected, selection_memory, preselected_unloaded, memory_rejections = select_model_for_memory(
             snapshot['devices'], context_length, task_hint, max_load_bytes, device=device, max_tokens=max_tokens)
     else:
         selected_device, selected = select_model(snapshot['devices'], model, device, context_length,
                                                  task_hint, max_load_bytes)
+        selection_memory = {'selection_reason': 'explicit model/device'}
     measured = benchmarks.summaries(task_hint, context_length).get((selected_device, selected['key'])) if model is None else None
     diagnostics.stage('queue', device=selected_device, model=selected['key'])
     with inference_lock(selected_device, wait_seconds=30):
@@ -751,10 +972,18 @@ def pair_smart_ask(
             owned_id = None
             cleanup = 'not_needed'
             load_time_seconds = None
+            memory = {'status': 'already_loaded'}
             engine_evicted_instances = []
             with management.client(selected_device) as c:
                 # Recheck after selection: another application may have changed the load state.
-                live = management.find_model(c, key, selected_device)
+                try:
+                    live = management.find_model(c, key, selected_device)
+                except ValueError:
+                    live = cached_loaded_model(selected_device, key)
+                    if live is None:
+                        raise
+                    reachability_warnings.append(
+                        f'{selected_device}: live model inventory check failed; using the last known loaded instance for one attempt.')
                 inference_io.require_structured(live, fmt)
                 inference_io.output_budget(live, max_tokens, context_length)
                 if live.get('type') != 'llm':
@@ -765,11 +994,18 @@ def pair_smart_ask(
                 instances = live['loaded_instances']
                 if len(instances) > 1:
                     raise ValueError('Multiple instances of the selected model are loaded; choose and manage one explicitly')
+                device_config = management.devices()[selected_device]
                 if instances:
                     load_config = instances[0].get('config')
                     actual_context = load_config.get('context_length') if isinstance(load_config, dict) else None
                     if isinstance(actual_context, int) and actual_context < context_length:
                         raise ValueError('Loaded instance context is smaller than requested; choose a smaller context or another model')
+                    diagnostics.stage('preflight')
+                    memory['runtime_capacity'] = management.validate_runtime_capacity(
+                        telemetry.sample(device_config), require_gpu=True)
+                    if memory['runtime_capacity']['status'] == 'warning':
+                        memory['status'] = 'warning'
+                        memory['warnings'] = memory['runtime_capacity'].get('warnings', [])
                 if not instances:
                     diagnostics.stage('preflight')
                     before_rows = management.models(c, selected_device)
@@ -777,7 +1013,6 @@ def pair_smart_ask(
                     if candidate is None:
                         raise ValueError('Selected model disappeared before load; refresh inventory')
                     inference_io.output_budget(candidate, max_tokens, context_length)
-                    device_config = management.devices()[selected_device]
                     configured_cap = device_config.get('max_loaded_bytes')
                     cap = min(configured_cap, max_load_bytes) if configured_cap and max_load_bytes else (configured_cap or max_load_bytes)
                     try:
@@ -834,6 +1069,12 @@ def pair_smart_ask(
                         after_ids = {i['id'] for m in management.models(c, selected_device) for i in m['loaded_instances']}
                         intentional = {row['instance_id'] for row in preselected_unloaded}
                         engine_evicted_instances = sorted(before_ids - after_ids - intentional)
+                runtime_memory = management.validate_runtime_capacity(telemetry.sample(device_config), require_gpu=True)
+                memory['runtime_capacity'] = runtime_memory
+                if runtime_memory['status'] == 'warning':
+                    memory['status'] = 'warning'
+                    memory['warnings'] = list(dict.fromkeys([
+                        *memory.get('warnings', []), *runtime_memory.get('warnings', [])]))
                 budget = inference_io.output_budget(dict(live, loaded_instances=instances), max_tokens)
                 payload = {'model': management.chat_model_id(selected_device, key, instances[0]['id']),
                            'messages': [{'role': 'user', 'content': prompt}],
@@ -843,9 +1084,12 @@ def pair_smart_ask(
                     payload['response_format'] = fmt
                 try:
                     diagnostics.stage('inference')
-                    data = management.request(c, 'POST', '/v1/chat/completions', payload)
+                    result = _request_nonempty_completion(
+                        lambda: management.request(c, 'POST', '/v1/chat/completions', payload),
+                        key, selected_device, started, fmt,
+                        on_empty=lambda metadata: _start_completion_recovery(
+                            key, selected_device, payload, fmt, instances[0]['id'], metadata))
                     diagnostics.stage('validation')
-                    result = inference_io.validate_completion(completion(data, key, selected_device, started), fmt)
                 except Exception as exc:
                     # A timeout may leave inference running. Retain the instance for inspection.
                     details = management.describe_unloaded_instances(preselected_unloaded)
@@ -855,7 +1099,7 @@ def pair_smart_ask(
                         raise error from exc
                     raise
                 else:
-                    if owned_id and unload_after:
+                    if owned_id and unload_after and result.get('status') != 'recovering':
                         diagnostics.stage('cleanup')
                         # This lock excludes other bridge calls, but cannot observe external clients.
                         current = management.find_model(c, key, selected_device)['loaded_instances']
@@ -874,6 +1118,10 @@ def pair_smart_ask(
                         cleanup = 'existing_instance_preserved'
                     if model or device:
                         selection_reason = 'explicit model/device'
+                    elif selection_memory.get('selection_reason') == 'reused_loaded_model':
+                        selection_reason = 'reused an eligible already-loaded model'
+                    elif selection_memory.get('selection_reason') == 'last_successful_model':
+                        selection_reason = 'loaded the most recently successful model'
                     elif measured and measured['pass_rate'] >= .6:
                         selection_reason = (f"benchmark: {measured['passed']}/{measured['cases']} cases, "
                                             f"median {measured['median_latency_ms']} ms among memory-fit candidates")
@@ -887,7 +1135,8 @@ def pair_smart_ask(
                                 engine_evicted_instances=engine_evicted_instances,
                                 auto_unloaded_instances=preselected_unloaded,
                                 memory_preflight_rejections=memory_rejections,
-                                memory_preflight=memory if owned_id else {'status': 'already_loaded'},
+                                memory_preflight=memory,
+                                reachability_warnings=reachability_warnings,
                                 router_status=router_status, router_advertises_model=key in router_models)
 
 
@@ -903,6 +1152,7 @@ async def _job_stream(job: jobs.Job, c: httpx.AsyncClient, instance_id: str, pro
         if enable_thinking is not None:
             payload['enable_thinking'] = enable_thinking
         ended = False
+        usage, reasoning_characters, special = {}, 0, {}
         async with c.stream('POST', '/v1/chat/completions', json=payload) as response:
             if not response.is_success:
                 raise ValueError(f'Device returned HTTP {response.status_code}; no retry was made')
@@ -927,37 +1177,55 @@ async def _job_stream(job: jobs.Job, c: httpx.AsyncClient, instance_id: str, pro
                     raise ValueError('Device returned invalid SSE event')
                 if 'error' in data:
                     raise ValueError('Device reported a streaming error')
+                usage.update(recovery.safe_usage(data.get('usage')))
                 choices = data.get('choices')
                 if not isinstance(choices, list) or not choices:
+                    if choices not in (None, []) or (choices is None and 'usage' not in data):
+                        raise recovery.InferenceFailure('invalid_response')
                     continue
                 first = choices[0]
+                if not isinstance(first, dict):
+                    raise recovery.InferenceFailure('invalid_response')
                 if isinstance(first, dict) and first.get('finish_reason') is not None:
                     reason = first['finish_reason']
+                    if not isinstance(reason, str):
+                        raise recovery.InferenceFailure('invalid_response')
                     job.finish_reason = reason if isinstance(reason, str) and reason in (
                         'stop', 'length', 'tool_calls', 'content_filter', 'function_call') else 'unknown'
                 delta = first.get('delta') if isinstance(first, dict) else None
-                content = delta.get('content') if isinstance(delta, dict) else None
-                if isinstance(content, str):
-                    job.add_text(content)
+                if delta is not None and not isinstance(delta, dict):
+                    raise recovery.InferenceFailure('invalid_response')
+                if isinstance(delta, dict):
+                    reasoning = delta.get('reasoning_content', delta.get('reasoning'))
+                    if isinstance(reasoning, str):
+                        reasoning_characters += len(reasoning)
+                    for key in ('refusal', 'tool_calls', 'function_call'):
+                        if delta.get(key):
+                            special[key] = True
+                try:
+                    text, part_reasoning, part_special = recovery.content_text(
+                        delta.get('content') if isinstance(delta, dict) else None, separator='')
+                except recovery.InferenceFailure as exc:
+                    raise recovery.InferenceFailure(exc.code, recovery.metadata(
+                        job.finish_reason, usage, reasoning_characters)) from None
+                reasoning_characters += part_reasoning
+                special.update(part_special)
+                if text:
+                    job.add_text(text)
                     job.update(stage='generating', progress=None)
-                elif isinstance(content, list):
-                    text = ''.join(part.get('text', '') for part in content
-                                   if isinstance(part, dict) and part.get('type') == 'text'
-                                   and isinstance(part.get('text'), str))
-                    if text:
-                        job.add_text(text)
-                        job.update(stage='generating', progress=None)
         if job.cancel_event.is_set():
             raise asyncio.CancelledError()
         if not ended:
             raise ValueError('Device stream ended before [DONE]')
-        if not job.answer.strip():
-            raise ValueError('Model returned no final text')
+        job.attempt_metadata = recovery.metadata(job.finish_reason, usage, reasoning_characters)
+        recovery.check_final(job.answer, job.attempt_metadata, special)
+        job.output_truncated = job.output_truncated or job.finish_reason == 'length'
         return job.answer
 
     payload = {'model': instance_id, 'input': prompt, 'max_output_tokens': max_tokens,
                'stream': True, 'store': False, 'integrations': []}
     ended = False
+    native_usage, native_reasoning = {}, 0
     async with c.stream('POST', '/api/v1/chat', json=payload) as response:
         if not response.is_success:
             raise ValueError(f'Device returned HTTP {response.status_code}; no retry was made')
@@ -990,29 +1258,140 @@ async def _job_stream(job: jobs.Job, c: httpx.AsyncClient, instance_id: str, pro
                 elif kind == 'message.delta' and isinstance(data.get('content'), str):
                     job.add_text(data['content'])
                     job.update(stage='generating', progress=None)
+                elif kind == 'reasoning.delta' and isinstance(data.get('content'), str):
+                    native_reasoning += len(data['content'])
                 elif kind == 'error':
                     raise ValueError('Device reported a streaming error')
                 elif kind == 'chat.end':
-                    result = data.get('result') or {}
-                    output = result.get('output') if isinstance(result, dict) else None
-                    if isinstance(output, list):
-                        final = ''.join(x.get('content', '') for x in output
-                                        if isinstance(x, dict) and x.get('type') == 'message' and isinstance(x.get('content'), str))
-                        if final:
-                            with job.lock:
-                                if not job.cancel_event.is_set():
-                                    job.answer = final[:48000]
-                                    job.output_truncated = len(final) > 48000
+                    result = data.get('result')
+                    if not isinstance(result, dict) or not isinstance(result.get('output'), list):
+                        raise recovery.InferenceFailure('invalid_response')
+                    output = result['output']
+                    final_parts, special = [], {}
+                    result_reasoning = 0
+                    for item in output:
+                        if not isinstance(item, dict):
+                            raise recovery.InferenceFailure('invalid_response')
+                        kind = item.get('type')
+                        if kind in ('tool_call', 'invalid_tool_call', 'function_call'):
+                            special['tool_calls'] = True
+                        elif kind == 'refusal':
+                            special['refusal'] = True
+                        elif kind in ('message', 'reasoning') and isinstance(item.get('content'), str):
+                            if kind == 'message':
+                                final_parts.append(item['content'])
+                            else:
+                                result_reasoning += len(item['content'])
+                        else:
+                            raise recovery.InferenceFailure('invalid_response')
+                    final = ''.join(final_parts)
+                    native_reasoning = max(native_reasoning, result_reasoning)
+                    with job.lock:
+                        if not job.cancel_event.is_set():
+                            job.answer = final[:48000]
+                            job.output_truncated = len(final) > 48000
                     ended = True
-                    job.finish_reason = 'stop'
+                    stats = result.get('stats') if isinstance(result, dict) else None
+                    stats = stats if isinstance(stats, dict) else {}
+                    reason = result.get('finish_reason', data.get('finish_reason', stats.get('stop_reason')))
+                    mapped = ({'maxPredictedTokensReached': 'length', 'eosFound': 'stop',
+                               'stopStringFound': 'stop'}.get(reason, reason) if isinstance(reason, str) else None)
+                    job.finish_reason = mapped if isinstance(mapped, str) and mapped in recovery.FINISH_REASONS else 'unknown'
+                    native_usage = recovery.safe_usage(result.get('usage'))
+                    native_usage.update(recovery.safe_usage({
+                        'prompt_tokens': stats.get('input_tokens'),
+                        'completion_tokens': stats.get('total_output_tokens'),
+                        'reasoning_tokens': stats.get('reasoning_output_tokens')}))
+                    job.attempt_metadata = recovery.metadata(job.finish_reason, native_usage, native_reasoning)
+                    recovery.check_final(job.answer, job.attempt_metadata, special)
                 event_type, data_text = None, ''
     if job.cancel_event.is_set():
         raise asyncio.CancelledError()
     if not ended:
         raise ValueError('Device stream ended before chat.end')
-    if not job.answer.strip():
-        raise ValueError('Model returned no final text')
+    job.attempt_metadata = recovery.metadata(job.finish_reason, native_usage, native_reasoning)
+    recovery.check_final(job.answer, job.attempt_metadata)
+    job.output_truncated = job.output_truncated or job.finish_reason == 'length'
     return job.answer
+
+
+async def _retry_job_empty_answer(job: jobs.Job, send_request, before_attempt=None) -> str:
+    """Retry confirmed empty completions indefinitely; explicit job cancellation stops the loop."""
+    retries = job.empty_answer_retries
+    while True:
+        if job.cancel_event.is_set():
+            raise asyncio.CancelledError()
+        if job.recovery_unpinned:
+            job.update(stage='waiting_for_device', next_retry_at=None,
+                       recovery_advice={'reason': 'router_target_unconfirmed',
+                                        'action': 'Use pair_job_reconfigure with an explicit configured device containing this exact loaded model. No further inference is sent until you choose it.'})
+            await asyncio.sleep(.25)
+            continue
+        if job.recovery_wait_revision is not None:
+            with job.lock:
+                waiting = job.recovery_revision == job.recovery_wait_revision
+            if waiting:
+                job.update(stage='waiting_for_configuration', next_retry_at=None,
+                           recovery_advice={'reason': 'budget_exhausted',
+                                            'action': 'Use pair_job_reconfigure with an explicitly approved budget or thinking setting.',
+                                            'context_and_output_target_tokens': 40000,
+                                            'output_budget': job.output_budget,
+                                            'saved_profile': recovery.load_profile(job.device, job.model)})
+                await asyncio.sleep(.25)
+                continue
+            job.recovery_wait_revision = None
+        if before_attempt is not None and (retries or job.recovery_initial_preflight):
+            try:
+                capacity = before_attempt()
+            except ValueError as exc:
+                if not management.is_capacity_error(exc):
+                    raise
+                job.update(stage='waiting_for_resources', next_retry_at=time.time() + 1,
+                           memory_preflight={'status': 'insufficient', 'reserve_bytes': management.MEMORY_RESERVE_BYTES})
+                await asyncio.sleep(1)
+                continue
+            job.update(memory_preflight=capacity)
+        with job.lock:
+            job.answer = ''
+            job.finish_reason = None
+            job.output_truncated = False
+        job.update(stage='inference', next_retry_at=None, recovery_advice=None)
+        try:
+            answer = await send_request()
+            recovery.check_final(answer, job.attempt_metadata)
+            with job.lock:
+                job.answer = answer[:48000]
+                job.output_truncated = job.output_truncated or len(answer) > 48000
+            metadata = dict(job.attempt_metadata, attempt=retries + 1, **job.recovery_parameters)
+            job.attempt_metadata = recovery.safe_metadata(metadata)
+            diagnostics.record_attempt(job.id, job.device, job.model, metadata, retries, 'attempt_completed')
+            job.update(empty_answer_retries=retries)
+            return answer
+        except ValueError as exc:
+            if management.is_capacity_error(exc):
+                job.update(stage='waiting_for_resources', next_retry_at=time.time() + 1,
+                           memory_preflight={'status': 'insufficient', 'reserve_bytes': management.MEMORY_RESERVE_BYTES})
+                await asyncio.sleep(1)
+                continue
+            if diagnostics.reason(exc) != 'empty_answer':
+                if isinstance(exc, recovery.InferenceFailure):
+                    job.attempt_metadata = exc.metadata
+                raise
+            retries += 1
+            metadata = recovery.safe_metadata(dict(getattr(exc, 'metadata', {}), attempt=retries,
+                                                    **job.recovery_parameters))
+            exhausted = recovery.budget_exhausted(metadata)
+            if exhausted:
+                metadata['cause'] = 'budget_exhausted'
+            diagnostics.record_attempt(job.id, job.device, job.model, metadata, retries)
+            delay = _empty_answer_retry_delay(retries)
+            job.update(stage='retrying_empty_answer', empty_answer_retries=retries,
+                       attempt_metadata=metadata, next_retry_at=time.time() + delay)
+            if exhausted:
+                with job.lock:
+                    job.recovery_wait_revision = job.recovery_revision
+                continue
+            await asyncio.sleep(delay)
 
 
 def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, unload_after: bool,
@@ -1037,21 +1416,23 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
             instances = selected['loaded_instances']
             if len(instances) > 1:
                 raise ValueError('Multiple model instances are loaded; choose one explicitly')
+            config = management.devices()[job.device]
             if instances:
+                memory = {'status': 'already_loaded'}
                 actual = (instances[0].get('config') or {}).get('context_length')
                 if isinstance(actual, int) and actual < context_length:
                     raise ValueError('Loaded instance context is smaller than requested')
                 instance_id = instances[0]['id']
             else:
                 job.update(stage='preflight')
-                config = management.devices()[job.device]
                 prepared = management.preflight_for_load(
                     c, job.device, job.model, context_length, config,
                     config.get('max_loaded_bytes'), telemetry.sample(config),
                     lambda: telemetry.sample(config))
                 selected = prepared['candidate']
                 inference_io.output_budget(selected, max_tokens, context_length)
-                job.update(auto_unloaded_instances=prepared['auto_unloaded_instances'])
+                job.update(auto_unloaded_instances=prepared['auto_unloaded_instances'],
+                           memory_preflight=prepared['memory'])
                 instances = selected['loaded_instances']
                 if instances:
                     if len(instances) != 1:
@@ -1081,6 +1462,23 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
                     if management.load_creates_owned_instance(job.device, load_attempt['result']):
                         owned_id = instance_id
                         job.update(instance_id=instance_id, owned=True)
+                memory = prepared['memory']
+            try:
+                runtime_capacity = management.validate_runtime_capacity(
+                    telemetry.sample(config), require_gpu=True)
+            except ValueError as exc:
+                if management.is_capacity_error(exc):
+                    memory['runtime_capacity'] = {
+                        'status': 'insufficient', 'reserve_bytes': management.MEMORY_RESERVE_BYTES,
+                        'error': str(exc)}
+                    job.update(memory_preflight=memory)
+                raise
+            memory['runtime_capacity'] = runtime_capacity
+            if runtime_capacity['status'] == 'warning':
+                memory['status'] = 'warning'
+                memory['warnings'] = list(dict.fromkeys([
+                    *memory.get('warnings', []), *runtime_capacity.get('warnings', [])]))
+            job.update(memory_preflight=memory)
             budget = inference_io.output_budget(selected, max_tokens)
             job.update(instance_id=instance_id, output_budget=budget)
             if job.cancel_event.is_set():
@@ -1090,15 +1488,24 @@ def _run_job(job: jobs.Job, prompt: str, context_length: int, max_tokens: int, u
                 job.update(status='cancelled', stage='cancelled')
                 return
             job.update(stage='inference')
+            job.recovery_target_instance = instance_id
+            job.recovery_parameters = {'max_tokens': max_tokens}
+            if enable_thinking is not None:
+                job.recovery_parameters['enable_thinking'] = enable_thinking
             async def stream_request():
                 async with httpx.AsyncClient(base_url=str(c.base_url), headers=c.headers,
                                              timeout=180, trust_env=False, follow_redirects=False) as stream_client:
-                    if enable_thinking is not None:
-                        return await _job_stream(job, stream_client, instance_id, prompt, max_tokens,
-                                                 response_format, enable_thinking)
-                    if response_format is not None:
-                        return await _job_stream(job, stream_client, instance_id, prompt, max_tokens, response_format)
-                    return await _job_stream(job, stream_client, instance_id, prompt, max_tokens)
+                    def send_request():
+                        with job.lock:
+                            tokens = job.recovery_parameters['max_tokens']
+                            thinking = job.recovery_parameters.get('enable_thinking')
+                        if thinking is not None:
+                            return _job_stream(job, stream_client, instance_id, prompt, tokens, response_format, thinking)
+                        if response_format is not None:
+                            return _job_stream(job, stream_client, instance_id, prompt, tokens, response_format)
+                        return _job_stream(job, stream_client, instance_id, prompt, tokens)
+                    return await _retry_job_empty_answer(
+                        job, send_request, lambda: _recovery_preflight(c, job.device, job.model, instance_id))
             loop = asyncio.new_event_loop()
             try:
                 task = loop.create_task(stream_request())
@@ -1164,7 +1571,9 @@ def pair_job_start(device: str, model: str, prompt: Annotated[str, Field(min_len
     Start every target before polling pair_job_status. Same-device jobs serialize
     with a 30s queue timeout; at most eight active jobs per bridge process.
     Each call accepts its own prompt/model for an individual task on that PC.
-    No download, automatic retry or fallback. Job IDs belong to this MCP process.
+    Empty final answers retry indefinitely with bounded backoff and the same loaded instance; cancel with pair_job_cancel.
+    Cold-load telemetry warnings appear in pair_job_status.memory_preflight. Other errors are not retried.
+    No download or model fallback. Job IDs belong to this MCP process.
     """
     fmt = inference_io.response_format(response_format, json_schema)
     if device not in management.devices() or not prompt.strip():
@@ -1264,7 +1673,11 @@ def pair_batch_start(requests: Annotated[list[BatchRequest], Field(min_length=1,
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
 def pair_batch_status(batch_id: str) -> dict:
-    """Read independent batch results in this MCP process; never retry failed jobs."""
+    """Read independent batch results in this MCP process.
+
+    Each member retries confirmed empty final answers indefinitely on its same
+    instance. This status read never resubmits a completed or failed member.
+    """
     return jobs.batch_status(batch_id)
 
 
@@ -1299,13 +1712,16 @@ def pair_embeddings(device: str, model: str, input: str | list[str],
         instances = item['loaded_instances']
         if len(instances) != 1:
             raise ValueError('Embeddings require exactly one already-loaded instance; use pair_load first')
+        memory = management.validate_runtime_capacity(
+            telemetry.sample(management.devices()[device]), require_gpu=True)
         diagnostics.stage('inference')
         data = management.request(c, 'POST', '/v1/embeddings',
                                   {'model': management.chat_model_id(device, model, instances[0]['id']),
                                    'input': texts, 'encoding_format': 'float'})
         diagnostics.stage('validation')
         result = inference_io.embeddings(data, len(texts), expected_dimensions)
-    return dict(result, device=device, requested_model=model, instance_id=instances[0]['id'])
+    return dict(result, device=device, requested_model=model, instance_id=instances[0]['id'],
+                memory_preflight=memory)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
@@ -1333,22 +1749,118 @@ def pair_vision_ask(device: str, model: str, prompt: Annotated[str, Field(min_le
         instances = item['loaded_instances']
         if len(instances) != 1:
             raise ValueError('Vision requires exactly one already-loaded instance; use pair_load first')
+        memory = management.validate_runtime_capacity(
+            telemetry.sample(management.devices()[device]), require_gpu=True)
         payload = {'model': management.chat_model_id(device, model, instances[0]['id']),
                    'messages': [{'role': 'user', 'content': content}], 'max_tokens': max_tokens, 'stream': False}
         if fmt is not None:
             payload['response_format'] = fmt
         started = time.monotonic()
         diagnostics.stage('inference')
-        data = management.request(c, 'POST', '/v1/chat/completions', payload)
+        result = _request_nonempty_completion(
+            lambda: management.request(c, 'POST', '/v1/chat/completions', payload),
+            model, device, started, fmt,
+            on_empty=lambda metadata: _start_completion_recovery(
+                model, device, payload, fmt, instances[0]['id'], metadata))
         diagnostics.stage('validation')
-        result = inference_io.validate_completion(completion(data, model, device, started), fmt)
-    return dict(result, output_budget=budget, instance_id=instances[0]['id'], image_count=len(images))
+    return dict(result, output_budget=budget, instance_id=instances[0]['id'], image_count=len(images),
+                memory_preflight=memory)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+def pair_job_reconfigure(job_id: str,
+                         max_tokens: Annotated[int | None, Field(ge=32)] = None,
+                         enable_thinking: StrictBool | None = None,
+                         use_saved_profile: StrictBool = False,
+                         remember: StrictBool = True,
+                         device: str | None = None) -> dict:
+    """Resume waiting recovery with explicitly approved settings; never load/reload a model.
+
+    Changing loaded context requires a separate authorized operation. Use_saved_profile
+    reuses only settings previously explicitly approved for this exact device/model.
+    """
+    if any(type(v) is not bool for v in (use_saved_profile, remember)):
+        raise ValueError('Profile controls must be booleans')
+    with jobs._lock:
+        job = jobs._jobs.get(job_id)
+    if job is None:
+        raise ValueError('Recovery reconfiguration requires a live process-local job')
+    with job.lock:
+        revision = job.recovery_revision
+        if job.status in jobs.TERMINAL or job.stage not in (
+                'waiting_for_device', 'waiting_for_configuration', 'waiting_for_resources', 'retrying_empty_answer'):
+            raise ValueError('Job is not waiting for recovery; inspect pair_job_status')
+        previous = dict(job.recovery_parameters)
+        metadata = dict(job.attempt_metadata)
+        original_device = job.device
+        binding = job.recovery_unpinned and original_device == 'pair-router'
+        selected_device = device if binding else original_device
+        if binding and (not device or device not in management.devices()):
+            raise ValueError('Router recovery requires an explicit configured device with this exact loaded model')
+        if not binding and device is not None and device != original_device:
+            raise ValueError('Cannot move pinned recovery to another device')
+    parameters = dict(previous)
+    if use_saved_profile:
+        parameters.update(recovery.load_profile(selected_device, job.model))
+    if max_tokens is not None:
+        if type(max_tokens) is not int or max_tokens < 32:
+            raise ValueError('max_tokens must be an integer >= 32')
+        parameters['max_tokens'] = max_tokens
+    if enable_thinking is not None:
+        if type(enable_thinking) is not bool:
+            raise ValueError('enable_thinking must be a boolean')
+        parameters['enable_thinking'] = enable_thinking
+    if parameters == previous and not binding:
+        raise ValueError('Approve a changed budget/thinking setting; unchanged exhausted requests are not resubmitted')
+    with management.client(selected_device) as c:
+        item = management.find_model(c, job.model, selected_device)
+        instances = item.get('loaded_instances', [])
+        if item.get('type') != 'llm' or len(instances) != 1 or (not binding and instances[0]['id'] != job.instance_id):
+            raise recovery.InferenceFailure('target_changed')
+        selected_instance = instances[0]['id']
+        if 'enable_thinking' in parameters:
+            request_thinking_options(c, selected_device, parameters['enable_thinking'])
+    budget = inference_io.output_budget(item, parameters['max_tokens'])
+    prompt_budget = inference_io.prompt_budget(item, parameters['max_tokens'], metadata.get('usage', {}).get('prompt_tokens'))
+    if prompt_budget['request_fits'] is False:
+        raise ValueError('Prompt plus requested output exceeds the loaded context; authorize a different budget or context separately')
+    with job.lock:
+        if job.recovery_revision != revision or job.cancel_event.is_set() or job.status in jobs.TERMINAL or job.stage not in (
+                'waiting_for_device', 'waiting_for_configuration', 'waiting_for_resources', 'retrying_empty_answer'):
+            raise ValueError('Job state changed during validation; inspect pair_job_status')
+        if remember:
+            recovery.save_profile(selected_device, job.model, parameters)
+        if binding:
+            job.recovery_device = selected_device
+            job.recovery_unpinned = False
+            job.recovery_target_instance = selected_instance
+            job.device = selected_device
+            job.instance_id = selected_instance
+        job.update(recovery_parameters=parameters, recovery_revision=revision + 1,
+                   recovery_advice=None, output_budget=dict(budget, prompt_budget=prompt_budget))
+    return job.snapshot()
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False))
 def pair_job_cancel(job_id: str) -> dict:
     """Request cancellation. Loading may finish first; an inference instance is preserved for inspection."""
     return jobs.cancel(job_id)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))
+def pair_logs(limit: Annotated[int, Field(ge=1, le=200)] = 50) -> dict:
+    """Read recent locally stored model results and sanitized error outcomes."""
+    rows, status = diagnostics.recent_outcomes(limit)
+    return {'status': status, 'records': rows, 'count': len(rows),
+            'contains_model_output': any('answer' in row or 'structured_output' in row for row in rows),
+            'notice': 'Results may contain sensitive text. Prompts, credentials, raw engine errors and embedding vectors are not stored.'}
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False))
+def pair_logs_export(output_path: Annotated[str, Field(min_length=1, max_length=4096)],
+                     limit: Annotated[int, Field(ge=1, le=200)] = 200) -> dict:
+    """Export recent outcomes to a new local JSONL file; existing files are never overwritten."""
+    return diagnostics.export_outcomes(output_path, limit)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False, openWorldHint=False))

@@ -140,13 +140,15 @@ Model names differ between installations. Let `/pair` inspect the live catalog b
 
 ## Connect your PAIR router
 
-The default address is **`http://127.0.0.1:1234/v1`**. This is the PAIR proxy in the tested setup. Check the endpoint displayed by your PAIR installation if it uses a different port.
+The default address is **`http://127.0.0.1:1234/v1`**, the LM Studio-compatible PAIR endpoint. PAIR 1.0 exposes a separate OpenAI-compatible endpoint for llama.cpp (normally `http://127.0.0.1:8080/v1`). Copy the endpoint for the engine you want to use from PAIR's **Endpoints** view; endpoint ports can vary by installation. See NVIDIA's [PAIR endpoint guide](https://docs.nvidia.com/local-ai/nvpair/getting-started) for the current endpoint paths. Bridge sends standard OpenAI-compatible requests and does not manage llama.cpp model loading.
 
 To change it, create **`.pair-bridge.json` in your home directory**:
 
+For example, to use PAIR 1.0's llama.cpp endpoint:
+
 ```json
 {
-  "base_url": "http://127.0.0.1:1234/v1"
+  "base_url": "http://127.0.0.1:8080/v1"
 }
 ```
 
@@ -155,7 +157,7 @@ To change it, create **`.pair-bridge.json` in your home directory**:
 | macOS / Linux | `~/.pair-bridge.json` |
 | Windows | `%USERPROFILE%\.pair-bridge.json` |
 
-Use your **PAIR router's endpoint**. An individual model-engine endpoint only provides that server's models. `127.0.0.1` refers to the computer running the bridge.
+Use the PAIR endpoint for the engine you want to route through. For PAIR 1.0 llama.cpp, set `http://127.0.0.1:8080/v1`; for the LM Studio-compatible proxy, use its endpoint (normally `http://127.0.0.1:1234/v1`). The catalog and requests are scoped to the selected engine endpoint. `127.0.0.1` refers to the computer running the bridge.
 
 <details>
 <summary><strong>Environment variables and authentication</strong></summary>
@@ -203,7 +205,7 @@ For an installed but unloaded model, ask Codex to call `pair_memory_plan` with i
 {"device":"pc","model":"qwen/qwen3.8-27b","context_length":8192}
 ```
 
-The result reports the candidate estimate, estimates for already loaded instances at their actual contexts, `required_with_headroom_bytes`, and a fresh device-capacity sample. A cold load is blocked if the estimated additional need plus 10% exceeds measured available RAM or NVIDIA VRAM. You can also set `"max_loaded_bytes": 34359738368` (32 GiB) as an independent total-load policy. Unknown estimates or capacity are shown as unknown; a configured budget still fails closed when estimation is unavailable. Existing loaded models are reused without changing their context.
+The result reports the candidate estimate, estimates for already loaded instances at their actual contexts, `required_with_headroom_bytes`, and a fresh device-capacity sample. A cold load is blocked if the estimated additional need plus 10% would leave less than 1 GiB of measured free RAM or NVIDIA VRAM. If a fresh capacity measurement is unavailable, Bridge continues with a warning; an unknown model estimate also continues with a warning unless a configured `max_loaded_bytes` budget requires a full estimate. You can set `"max_loaded_bytes": 34359738368` (32 GiB) as an independent total-load policy. Existing loaded models are reused without changing their context. Background jobs expose the preflight status and warnings in `pair_job_status`.
 
 ### Load installed models only
 
@@ -316,7 +318,7 @@ Oh My Pi users can use the same MCP server and a native `/pair` command. See the
 - Exact model IDs only; the catalog is refreshed before inference.
 - Likely embedding and draft models are rejected for chat. Type hints are inferred from names.
 - Load, unload, and inference operations are queued per configured device across this user's bridge processes. Router calls use a separate lock because the destination is unknown. Other applications are outside these limits.
-- No automatic retries, fallback models, or downloads during a model request. The engine may load an already installed model and consume GPU/RAM.
+- If a chat completion returns no final text (`empty_answer`), Bridge retries the same model, loaded instance, prompt and options indefinitely with a backoff capped at 30 seconds. Only the delay is capped; there is no retry-count limit. HTTP errors, timeouts, load failures and invalid structured output are not retried. Use background jobs when you need `pair_job_cancel`; the engine may continue its current generation after stream cancellation. Bridge never substitutes a model or downloads weights during a retry.
 - Default output budget: 2,048 tokens; minimum: 32. There is no fixed 8,192 maximum. Fresh model output limits and actual loaded context bound `max_tokens`; a cold load also uses its requested context. Unknown limits are delegated to the engine. The engine accounts for prompt and reasoning tokens; a known ceiling is not a guarantee of remaining context. Input: up to 48,000 characters.
 - Request timeout: 180 seconds. Cancellation or timeout does not guarantee cancellation of the upstream model job.
 - Empty final answers are errors. Answers stopped by the output budget are marked as truncated.
@@ -384,8 +386,15 @@ codex plugin marketplace remove pair-bridge
 | `pair_batch_status(batch_id)` / `pair_batch_cancel(batch_id)` | Independent group outcomes and cancellation requests; terminal results are preserved. |
 | `pair_embeddings(device, model, input, expected_dimensions?)` | Validated float vectors for an exact already-loaded embedding instance. Complete indexes, finite values and consistent dimensions required. |
 | `pair_vision_ask(device, model, prompt, images, ...)` | Multimodal query to a loaded chat instance with fresh explicit vision support; bounded inline PNG/JPEG/WebP data URLs only. |
+| `pair_logs(limit?)` / `pair_logs_export(output_path, limit?)` | Read recent local results/errors or export them to a new JSONL file; export never overwrites or sends data. |
 
-`pair_ask`, `pair_smart_ask`, `pair_job_start`, each batch member and `pair_vision_ask` accept optional `json_schema` or `response_format`. Schemas are checked before mutations, and output is checked locally; success adds `structured_output`. Invalid JSON, schema mismatches and truncated answers fail without automatic retries. Draft 2020-12 schemas are limited to 32 KiB and 24 nesting levels; references must be inlined. Unknown JSON Schema model support allows an explicit attempt, while explicit unsupported metadata rejects it.
+`pair_ask`, `pair_smart_ask`, `pair_job_start`, each batch member and `pair_vision_ask` accept optional `json_schema` or `response_format`. Schemas are checked before mutations, and output is checked locally; success adds `structured_output`. Empty final answers are retried indefinitely on the same model and loaded instance. Invalid JSON, schema mismatches, truncated answers, HTTP errors and timeouts are not retried. Draft 2020-12 schemas are limited to 32 KiB and 24 nesting levels; references must be inlined. Unknown JSON Schema model support allows an explicit attempt, while explicit unsupported metadata rejects it.
+
+### Model result and error logs
+
+`pair_logs(limit=50)` reads recent local chat results and sanitized errors. The log stores final answer text or validated structured output, retry count, and a safe error code/message; it never stores prompts, schemas, image data, vectors, credentials or raw engine response bodies. Treat returned answers as potentially sensitive.
+
+`pair_logs_export(output_path, limit=200)` writes the same records to a new absolute `.jsonl` file in an existing directory. Existing files are never overwritten, and nothing is uploaded. Example: `pair_logs_export(output_path="C:\\Users\\<user>\\Desktop\\pair-bridge-logs.jsonl")`.
 
 Embeddings accept 1–32 nonblank texts, <=8192 characters each and <=48000 total. `expected_dimensions` checks rather than resizes vectors. Vision accepts 1–4 inline images, <=4 MiB decoded each and <=12 MiB total; it checks base64 and headers/containers, leaving pixel decoding to the engine. Files and remote image URLs are not read. Both tools require a loaded instance; use `pair_load` explicitly when needed.
 

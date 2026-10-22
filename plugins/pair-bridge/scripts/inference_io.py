@@ -106,6 +106,20 @@ def output_budget(item: dict, requested: int | None = None,
             'remaining_context': 'engine_validated_including_prompt_and_reasoning'}
 
 
+def prompt_budget(item, requested, prompt_tokens=None):
+    """Only a measured prompt count can establish remaining space; no character/token guess."""
+    instances = item.get('loaded_instances') or []
+    context = ((instances[0].get('config') or {}).get('context_length') if len(instances) == 1 else None)
+    if not _positive_int(context):
+        context = item.get('max_context_length')
+    known = _positive_int(context) and type(prompt_tokens) is int and prompt_tokens >= 0
+    available = max(context - prompt_tokens, 0) if known else None
+    return {'status': 'known' if known else 'unknown', 'prompt_tokens': prompt_tokens if known else None,
+            'remaining_output_tokens': available,
+            'request_fits': requested <= available if known else None,
+            'notice': 'Context includes prompt, final answer and reasoning. A 40000 context does not guarantee 40000 output tokens.'}
+
+
 def model_capabilities(item: dict, engine: str) -> dict:
     """Only explicit metadata establishes positive model support."""
     raw = item.get('capabilities')

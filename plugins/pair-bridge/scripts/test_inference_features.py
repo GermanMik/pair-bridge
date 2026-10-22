@@ -45,7 +45,8 @@ class FeatureTests(unittest.TestCase):
     def test_large_output_budget_payload_and_reject_before_inference(self):
         item = self.item(max_context_length=65536, loaded_instances=[
             {'id': 'exact-i', 'config': {'context_length': 32768}}], capabilities={'vision': True})
-        with patch.object(management, 'client'), patch.object(management, 'find_model', return_value=item), \
+        with patch.object(management, 'client'), patch.object(management, 'devices', return_value={'pc': {}}), \
+                patch.object(management, 'find_model', return_value=item), \
                 patch.object(management, 'engine_for', return_value='lmstudio'), \
                 patch.object(management, 'request', return_value={'choices': [
                     {'message': {'content': 'OK'}, 'finish_reason': 'stop'}]}) as request:
@@ -69,6 +70,21 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(job.status, 'failed')
         preflight.assert_not_called()
         load.assert_not_called()
+
+    def test_loaded_job_stops_before_inference_when_fresh_ram_reserve_is_breached(self):
+        item = self.item()
+        low_capacity = {'checked_at': time.time(), 'memory': {'available_bytes': 100},
+                        'gpu': {'status': 'ok', 'devices': [{'free_bytes': 2 * 2**30}]}}
+        with patch.object(jobs, '_append'), patch.object(server, 'inference_lock', return_value=contextlib.nullcontext()), \
+                patch.object(management, 'client'), patch.object(management, 'models', return_value=[item]), \
+                patch.object(management, 'devices', return_value={'pc': {}}), \
+                patch.object(server.telemetry, 'sample', return_value=low_capacity), \
+                patch.object(server, '_job_stream') as stream:
+            job = jobs.Job('pc', 'model')
+            server._run_job(job, 'prompt', 4096, 128, False)
+        self.assertEqual(job.status, 'failed')
+        self.assertEqual(job.memory_preflight['runtime_capacity']['status'], 'insufficient')
+        stream.assert_not_called()
 
     def test_smart_selection_skips_budget_incompatible_candidate_before_preflight(self):
         small = self.item(key='small', max_output_tokens=4096)
@@ -111,6 +127,11 @@ class FeatureTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        telemetry_patch = patch.object(server.telemetry, 'sample', return_value={
+            'checked_at': time.time(), 'memory': {'available_bytes': 2 * 2**30},
+            'gpu': {'status': 'ok', 'devices': [{'free_bytes': 2 * 2**30}]}})
+        telemetry_patch.start()
+        self.addCleanup(telemetry_patch.stop)
         for target, name, value in [(server, 'user_cache_path', Path(tmp.name)),
                                     (jobs, 'journal_path', Path(tmp.name) / 'jobs.jsonl')]:
             patcher = patch.object(target, name, return_value=value)
@@ -207,6 +228,7 @@ class FeatureTests(unittest.TestCase):
             with httpx.Client(base_url='http://engine', transport=httpx.MockTransport(handler)) as c:
                 yield c
         with patch.object(management, 'client', side_effect=client), \
+                patch.object(management, 'devices', return_value={'pc': {}}), \
                 patch.object(management, 'engine_for', return_value='lmstudio'):
             result = server.pair_ask('model', 'prompt', device='pc', json_schema=SCHEMA)
         self.assertEqual(result['structured_validation'], 'passed')
@@ -249,7 +271,8 @@ class FeatureTests(unittest.TestCase):
                 job.finish_reason = finish
                 return answer
             job = jobs.Job('pc', 'model')
-            with patch.object(management, 'client') as client, patch.object(management, 'models', return_value=[item]), \
+            with patch.object(management, 'devices', return_value={'pc': {}}), \
+                    patch.object(management, 'client') as client, patch.object(management, 'models', return_value=[item]), \
                     patch.object(management, 'unload_model') as unload, patch.object(server, '_job_stream', side_effect=stream):
                 client.return_value.__enter__.return_value.base_url = 'http://engine'
                 client.return_value.__enter__.return_value.headers = {}
@@ -267,10 +290,12 @@ class FeatureTests(unittest.TestCase):
         def request(c, method, route, body):
             calls.append((route, body))
             return {'data': [{'index': 1, 'embedding': [3.0, 4.0]}, {'index': 0, 'embedding': [1.0, 2.0]}]}
-        with patch.object(management, 'client'), patch.object(management, 'find_model', return_value=embedding), \
+        with patch.object(management, 'devices', return_value={'pc': {}}), \
+                patch.object(management, 'client'), patch.object(management, 'find_model', return_value=embedding), \
                 patch.object(management, 'engine_for', return_value='lmstudio'), patch.object(management, 'request', side_effect=request):
             result = server.pair_embeddings('pc', 'model', ['one', 'two'], expected_dimensions=2)
         self.assertEqual(result['vectors'], [[1.0, 2.0], [3.0, 4.0]])
+        self.assertEqual(result['memory_preflight']['status'], 'ok')
         self.assertEqual(calls[0], ('/v1/embeddings', {'model': 'exact-i', 'input': ['one', 'two'], 'encoding_format': 'float'}))
 
     def test_embeddings_fail_closed_on_wrong_models_inputs_and_vectors(self):
@@ -294,7 +319,8 @@ class FeatureTests(unittest.TestCase):
 
     def test_vision_requires_confirmed_support_and_uses_multimodal_payload(self):
         item = self.item(capabilities={'vision': True})
-        with patch.object(management, 'client'), patch.object(management, 'find_model', return_value=item), \
+        with patch.object(management, 'devices', return_value={'pc': {}}), \
+                patch.object(management, 'client'), patch.object(management, 'find_model', return_value=item), \
                 patch.object(management, 'engine_for', return_value='lmstudio'), \
                 patch.object(management, 'request', return_value={'choices': [
                     {'message': {'content': 'a dot'}, 'finish_reason': 'stop'}]}) as request:
@@ -303,11 +329,30 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(body['model'], 'exact-i')
         self.assertEqual(body['messages'][0]['content'][1]['image_url']['url'], PNG)
         self.assertEqual(result['image_count'], 1)
+        self.assertEqual(result['memory_preflight']['status'], 'ok')
         for capability in [None, False]:
             with patch.object(management, 'client'), patch.object(management, 'find_model', return_value=self.item(capabilities={'vision': capability})), \
                     patch.object(management, 'engine_for', return_value='lmstudio'), patch.object(management, 'request') as request:
                 with self.assertRaisesRegex(ValueError, 'vision support'):
                     server.pair_vision_ask('pc', 'model', 'describe', [PNG])
+                request.assert_not_called()
+
+    def test_loaded_vision_and_embedding_calls_stop_on_measured_memory_shortage(self):
+        low_capacity = {'checked_at': time.time(), 'memory': {'available_bytes': 100},
+                        'gpu': {'status': 'ok', 'devices': [{'free_bytes': 2 * 2**30}]}}
+        for item, invoke in [
+            (self.item(type='embedding'), lambda: server.pair_embeddings('pc', 'model', 'text')),
+            (self.item(capabilities={'vision': True}), lambda: server.pair_vision_ask('pc', 'model', 'describe', [PNG])),
+        ]:
+            with self.subTest(model_type=item['type']), \
+                    patch.object(management, 'devices', return_value={'pc': {}}), \
+                    patch.object(management, 'client'), \
+                    patch.object(management, 'find_model', return_value=item), \
+                    patch.object(management, 'engine_for', return_value='lmstudio'), \
+                    patch.object(server.telemetry, 'sample', return_value=low_capacity), \
+                    patch.object(management, 'request') as request:
+                with self.assertRaisesRegex(ValueError, '1 GiB free reserve'):
+                    invoke()
                 request.assert_not_called()
 
     def test_vision_rejects_urls_paths_bad_base64_mime_and_oversize_before_client(self):

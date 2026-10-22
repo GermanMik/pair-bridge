@@ -22,10 +22,42 @@ class OperationsTests(unittest.TestCase):
         estimate = {'total_bytes': 20 * 2**30, 'gpu_bytes': 19 * 2**30, 'context_length': 8192}
         capacity = {'checked_at': __import__('time').time(),
                     'memory': {'available_bytes': 30 * 2**30},
-                    'gpu': {'devices': [{'free_bytes': 2 * 2**30}]}}
+                    'gpu': {'status': 'ok', 'devices': [{'free_bytes': 2 * 2**30}]}}
         with patch.object(management, 'estimate_memory', return_value=estimate):
             with self.assertRaisesRegex(ValueError, 'GPU memory'):
                 management.memory_preflight('pc', [candidate], candidate, 8192, None, capacity)
+
+    def test_memory_preflight_preserves_one_gib_ram_and_vram(self):
+        gib = 2**30
+        candidate = {'key': 'new', 'loaded_instances': []}
+        estimate = {'total_bytes': 4 * gib, 'gpu_bytes': 3 * gib, 'context_length': 8192}
+        required_vram = round(estimate['gpu_bytes'] * 1.1) + gib
+        with patch.object(management, 'estimate_memory', return_value=estimate):
+            below_ram_reserve = {'checked_at': __import__('time').time(),
+                                 'memory': {'available_bytes': 2 * gib},
+                                 'gpu': {'status': 'ok', 'devices': [{'free_bytes': 8 * gib}]}}
+            with self.assertRaisesRegex(ValueError, '1 GiB free reserve'):
+                management.memory_preflight('pc', [candidate], candidate, 8192, None, below_ram_reserve)
+
+            below_vram_reserve = {'checked_at': __import__('time').time(),
+                                  'memory': {'available_bytes': 8 * gib},
+                                  'gpu': {'status': 'ok', 'devices': [{'free_bytes': required_vram - 1}]}}
+            with self.assertRaisesRegex(ValueError, '1 GiB free VRAM reserve'):
+                management.memory_preflight('pc', [candidate], candidate, 8192, None, below_vram_reserve)
+
+            enough = {'checked_at': __import__('time').time(),
+                      'memory': {'available_bytes': 4 * gib},
+                      'gpu': {'status': 'ok', 'devices': [{'free_bytes': required_vram}]}}
+            result = management.memory_preflight('pc', [candidate], candidate, 8192, None, enough)
+            self.assertEqual(result['warnings'], [])
+
+    def test_memory_preflight_warns_and_continues_when_fresh_telemetry_is_unknown(self):
+        candidate = {'key': 'new', 'loaded_instances': []}
+        estimate = {'total_bytes': 4 * 2**30, 'gpu_bytes': 3 * 2**30, 'context_length': 8192}
+        with patch.object(management, 'estimate_memory', return_value=estimate):
+            result = management.memory_preflight('pc', [candidate], candidate, 8192, None)
+        self.assertEqual(result['status'], 'warning')
+        self.assertTrue(any('memory telemetry is unavailable' in warning for warning in result['warnings']))
 
     def test_benchmark_ranking_is_measured_and_prompt_free(self):
         with tempfile.TemporaryDirectory() as temp, \

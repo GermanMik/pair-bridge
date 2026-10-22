@@ -1,14 +1,14 @@
 {
   "name": "pair-bridge",
-  "version": "0.8.3",
-  "description": "Use local models through PAIR with versioned benchmarks, bounded loading, installed-only model management, structured output and concurrent jobs.",
+  "version": "0.8.4",
+  "description": "Use local models through PAIR with unlimited empty-answer retries, memory-aware loading, local result logs, structured output and concurrent jobs.",
   "author": {
     "name": "GermanMik"
   },
   "interface": {
     "displayName": "PAIR Bridge",
-    "shortDescription": "Benchmark and consult local models through PAIR.",
-    "longDescription": "Run nested local model benchmarks, query durable quality/speed/error metrics and compare models; inspect capabilities, validate structured output and start concurrent jobs.",
+    "shortDescription": "Consult and manage local models through PAIR.",
+    "longDescription": "Retry empty answers without a count limit, preserve a measured 1 GiB memory reserve, export local request results, inspect capabilities and start concurrent jobs.",
     "developerName": "GermanMik",
     "category": "Productivity",
     "capabilities": [],

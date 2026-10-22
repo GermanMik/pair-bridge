@@ -13,6 +13,8 @@ import time
 from urllib.parse import urlsplit
 import httpx
 
+MIN_FREE_MEMORY_BYTES = 2**30
+
 
 def devices():
     path = Path.home() / '.pair-bridge.json'
@@ -462,6 +464,57 @@ def estimate_memory(device_id, model, context_length):
     return dict(values, context_length=context_length, source='lms load --estimate-only')
 
 
+MEMORY_RESERVE_BYTES = 2**30
+CAPACITY_MAX_AGE_SECONDS = 15
+
+
+def validate_runtime_capacity(capacity, *, incoming=None, require_gpu=False):
+    """Check fresh telemetry when available; report unknowns without blocking work."""
+    warnings = []
+    if not isinstance(capacity, dict) or not isinstance(capacity.get('checked_at'), (int, float)):
+        return {'status': 'warning', 'reserve_bytes': MEMORY_RESERVE_BYTES,
+                'warnings': ['Device memory telemetry is unavailable; 1 GiB reserve is unverified']}
+    age = time.time() - capacity['checked_at']
+    if age < 0 or age > CAPACITY_MAX_AGE_SECONDS:
+        return {'status': 'warning', 'checked_at': capacity['checked_at'],
+                'reserve_bytes': MEMORY_RESERVE_BYTES,
+                'warnings': ['Device memory telemetry is stale; 1 GiB reserve is unverified']}
+    memory = capacity.get('memory')
+    memory = memory if isinstance(memory, dict) else {}
+    available = memory.get('available_bytes')
+    if not isinstance(available, int) or isinstance(available, bool) or available < 0:
+        warnings.append('Available device memory is unknown; system-memory reserve is unverified')
+    gpu = capacity.get('gpu')
+    gpu_rows = gpu.get('devices') if isinstance(gpu, dict) and gpu.get('status') == 'ok' else []
+    gpu_rows = gpu_rows if isinstance(gpu_rows, list) else []
+    gpu_free = sum(row.get('free_bytes', 0) for row in gpu_rows
+                   if isinstance(row, dict) and isinstance(row.get('free_bytes'), int) and
+                   not isinstance(row.get('free_bytes'), bool) and row['free_bytes'] >= 0)
+    needs_gpu_measurement = require_gpu or (incoming is not None and incoming.get('gpu_bytes', 0) > 0)
+    if needs_gpu_measurement and not gpu_rows and memory.get('gpu_memory') != 'unified_with_system_memory':
+        warnings.append('GPU memory telemetry is unknown; 1 GiB free VRAM reserve is unverified')
+    system_needed = MEMORY_RESERVE_BYTES
+    gpu_needed = MEMORY_RESERVE_BYTES
+    if incoming is not None:
+        gpu_needed += round(incoming['gpu_bytes'] * 1.1)
+        if memory.get('gpu_memory') == 'unified_with_system_memory':
+            system_needed += round(incoming['total_bytes'] * 1.1)
+            gpu_needed = 0
+        elif gpu_rows:
+            system_needed += round(max(incoming['total_bytes'] - incoming['gpu_bytes'], 0) * 1.1)
+        elif incoming['gpu_bytes'] > 0:
+            pass  # VRAM is unverified; the warning above keeps that state visible.
+        else:
+            system_needed += round(incoming['total_bytes'] * 1.1)
+    if isinstance(available, int) and not isinstance(available, bool) and available < system_needed:
+        raise ValueError('Insufficient available system memory to preserve the 1 GiB free reserve')
+    if gpu_needed and gpu_rows and gpu_free < gpu_needed:
+        raise ValueError('Insufficient available GPU memory to preserve the 1 GiB free VRAM reserve')
+    return {'status': 'warning' if warnings else 'ok', 'available_system_bytes': available,
+            'available_gpu_bytes': gpu_free if gpu_rows else None,
+            'reserve_bytes': MEMORY_RESERVE_BYTES, 'checked_at': capacity['checked_at'], 'warnings': warnings}
+
+
 def memory_preflight(device_id, rows, candidate, context_length, max_loaded_bytes, capacity=None):
     """Estimate each running instance and the candidate at its actual/planned context."""
     if candidate['loaded_instances']:
@@ -481,25 +534,19 @@ def memory_preflight(device_id, rows, candidate, context_length, max_loaded_byte
         required = round(total * 1.1)
         if max_loaded_bytes is not None and required > max_loaded_bytes:
             raise ValueError('Device estimated memory limit would be exceeded; no model was loaded')
-        if isinstance(capacity, dict) and time.time() - capacity.get('checked_at', 0) <= 15:
-            available = capacity.get('memory', {}).get('available_bytes')
-            gpu_rows = capacity.get('gpu', {}).get('devices') or []
-            gpu_free = sum(g.get('free_bytes', 0) for g in gpu_rows)
-            # Compare incremental need with currently available capacity: existing loads already occupy memory.
-            system_needed = (max(incoming['total_bytes'] - incoming['gpu_bytes'], 2**30) if gpu_rows
-                             else incoming['total_bytes'])
-            if isinstance(available, int) and round(system_needed * 1.1) > available:
-                raise ValueError('Insufficient currently available system memory for this model and context')
-            if gpu_rows and round(incoming['gpu_bytes'] * 1.1) > gpu_free:
-                raise ValueError('Insufficient currently available GPU memory for this model and context')
-        return {'status': 'estimated', 'candidate': incoming, 'loaded': current,
+        capacity_check = validate_runtime_capacity(capacity, incoming=incoming)
+        return {'status': 'warning' if capacity_check['status'] == 'warning' else 'estimated',
+                'warnings': capacity_check.get('warnings', []), 'candidate': incoming, 'loaded': current,
                 'estimated_total_bytes': total, 'required_with_headroom_bytes': required,
-                'max_loaded_bytes': max_loaded_bytes, 'capacity': capacity,
-                'note': 'CLI load estimate plus a separate live capacity sample when available; leave headroom for the OS and other applications.'}
+                'max_loaded_bytes': max_loaded_bytes, 'capacity': capacity_check,
+                'note': 'CLI load estimate plus fresh Bridge RAM/VRAM telemetry; preserve at least 1 GiB of free measured capacity.'}
     except ValueError as exc:
-        if max_loaded_bytes is not None or 'limit would be exceeded' in str(exc) or 'Insufficient currently available' in str(exc):
+        if (max_loaded_bytes is not None or 'limit would be exceeded' in str(exc) or
+                'Insufficient' in str(exc) or 'telemetry' in str(exc) or 'memory is unknown' in str(exc) or
+                'memory telemetry' in str(exc) or 'GPU memory telemetry' in str(exc)):
             raise
-        return {'status': 'unknown', 'reason': str(exc),
+        return {'status': 'warning', 'reason': str(exc),
+                'warnings': ['Required memory could not be estimated; the 1 GiB free-memory reserve is unverified.'],
                 'note': 'No configured memory cap; loading may still fail or evict another instance.'}
 
 
@@ -507,6 +554,11 @@ def is_capacity_error(error):
     text = str(error)
     return any(marker in text for marker in (
         'Insufficient currently available',
+        'Insufficient available',
+        'telemetry is unavailable',
+        'telemetry is stale',
+        'memory is unknown',
+        'GPU memory telemetry is unknown',
         'Device reports insufficient available memory',
         'estimated memory limit would be exceeded',
         'model-weight limit would be exceeded',
