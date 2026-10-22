@@ -32,7 +32,17 @@ class BenchmarkProtocolTests(unittest.IsolatedAsyncioTestCase):
                 self.send_header('Content-Type', mime)
                 self.send_header('Content-Length', str(len(raw)))
                 self.end_headers()
-                self.wfile.write(raw)
+                if mime == 'text/event-stream':
+                    # Ensure a measurable real interval even on Windows clocks
+                    # with a coarse tick; production correctly reports unknown
+                    # throughput when the measured duration is zero.
+                    split = raw.index(b'\n\n') + 2
+                    self.wfile.write(raw[:split])
+                    self.wfile.flush()
+                    time.sleep(.03)
+                    self.wfile.write(raw[split:])
+                else:
+                    self.wfile.write(raw)
 
             def do_GET(self):
                 seen.append((self.path, None))
