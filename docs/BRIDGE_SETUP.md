@@ -12,7 +12,7 @@ For inference through NVIDIA PAIR 1.0, set the top-level `base_url` to the endpo
 {"devices":[{"id":"local-lmstudio","engine":"lmstudio","base_url":"http://127.0.0.1:1234"}]}
 ```
 
-For remote Unsloth, enable its OpenAI-compatible server and explicitly configure its advertised origin. Keyless LAN inference requires **Chat and inference**; **Full access** is limited to localhost. A device configured with `api_key_env` still requires that environment variable even when the engine has keyless access. Remove that field only when intentionally configuring keyless access. For authenticated access, use `api_key_env: "UNSLOTH_STUDIO_AUTH_TOKEN"` and set that variable before starting Codex; the packaged MCP configuration forwards this named variable. Custom variable names require adding the same name to the MCP `env_vars` list. Restart the MCP process after changing its environment. Never put the token in the config or chat.
+For remote Unsloth, enable its OpenAI-compatible server and explicitly configure its advertised origin. Keyless LAN inference requires **Chat and inference**; **Full access** is limited to localhost. A device configured with `api_key_env` still requires that environment variable even when the engine has keyless access. Remove that field only when intentionally configuring keyless access. For authenticated access, set `api_key_env` to the name of an environment variable containing an authorized token and set it before starting Codex. The packaged `.mcp.json` forwards only `PAIR_BASE_URL` and `PAIR_API_KEY`; it does not forward `UNSLOTH_STUDIO_AUTH_TOKEN` by default. To use that credential, add the variable name (not its value) to the installed plugin `.mcp.json` `env_vars` list. Restart the MCP process after changing its environment. Never put the token in the config or chat.
 
 For local Unsloth only, Bridge can exchange an **existing**, explicitly selected desktop credential for a short-lived token:
 
@@ -21,6 +21,8 @@ For local Unsloth only, Bridge can exchange an **existing**, explicitly selected
 ```
 
 Replace the placeholder with a real absolute path from your installation. Bridge does not search for, generate or copy credentials. This option rejects remote origins, SSH tunnels and combinations with `api_key_env`. The token stays in client memory, reaches asynchronous jobs and is not saved to config or journals. Redirects are not followed.
+
+After restarting the MCP process, use `pair_devices` and `pair_list(device="local-unsloth")` to check the connection and discover exact installed model IDs. Use an existing loaded model for a small inference check or explicitly load an installed model with `pair_load`. A catalog entry alone does not prove loading or inference works. For GGUF entries in the form `publisher/model-GGUF:variant`, Bridge sends the repository and variant separately for loading and memory estimation. Bridge does not download models.
 
 ## Native device discovery
 

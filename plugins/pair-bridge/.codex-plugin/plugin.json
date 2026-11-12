@@ -1,6 +1,6 @@
 {
   "name": "pair-bridge",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "description": "Use local models through PAIR with unlimited empty-answer retries, memory-aware loading, local result logs, structured output and concurrent jobs.",
   "author": {
     "name": "GermanMik"

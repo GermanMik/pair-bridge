@@ -244,6 +244,10 @@ def models(c, device_id=None):
         rows = request(c, 'GET', '/v1/models').get('data')
         if not isinstance(rows, list):
             raise ValueError('Unsloth Studio OpenAI models API is required')
+        id_counts = {}
+        for candidate in rows:
+            if isinstance(candidate, dict) and isinstance(candidate.get('id'), str) and candidate['id']:
+                id_counts[candidate['id']] = id_counts.get(candidate['id'], 0) + 1
         out = []
         for row in rows:
             if (not isinstance(row, dict) or not isinstance(row.get('id'), str) or
@@ -254,6 +258,12 @@ def models(c, device_id=None):
                         'context_length': row['context_length']
                     } if isinstance(row.get('context_length'), int) and not isinstance(row.get('context_length'), bool) else {}}]
                                          if row['loaded'] else [])}
+            quant = row.get('quant')
+            base_id, separator, suffix = row['id'].rpartition(':')
+            if (isinstance(quant, str) and quant and separator and suffix == quant and
+                    id_counts.get(base_id) == 1):
+                item['gguf_base_model'] = base_id
+                item['gguf_variant'] = quant
             if row.get('type') in ('llm', 'embedding'):
                 item['type'] = row['type']
                 item['type_source'] = 'engine_metadata'
@@ -306,11 +316,24 @@ def find_model(c, key, device_id=None):
     return rows[0]
 
 
-def load_model(c, device_id, model_key, context_length, model_type='llm'):
+def unsloth_model_fields(model_key, catalog_row=None):
+    """Separate only an inventory-confirmed Unsloth GGUF pin variant."""
+    if isinstance(catalog_row, dict) and catalog_row.get('key') == model_key:
+        base_id = catalog_row.get('gguf_base_model')
+        quant = catalog_row.get('gguf_variant')
+        if (isinstance(base_id, str) and base_id and isinstance(quant, str) and quant and
+                model_key == f'{base_id}:{quant}'):
+            return {'model_path': base_id, 'gguf_variant': quant}
+    return {'model_path': model_key}
+
+
+def load_model(c, device_id, model_key, context_length, model_type='llm', catalog_row=None):
     total_timeout = devices().get(device_id, {}).get('load_timeout_seconds', 180)
     if engine_for(device_id) == 'unsloth':
+        if catalog_row is None and ':' in model_key:
+            catalog_row = find_model(c, model_key, device_id)
         return request(c, 'POST', '/api/inference/load', {
-            'model_path': model_key,
+            **unsloth_model_fields(model_key, catalog_row),
             'n_ctx': context_length,
             'max_seq_length': context_length,
         }, total_timeout=total_timeout)
@@ -415,15 +438,17 @@ def ensure_capacity(rows, candidate, max_loaded_bytes):
         raise ValueError('Device model-weight limit would be exceeded; no model was unloaded or loaded')
 
 
-def estimate_memory(device_id, model, context_length):
+def estimate_memory(device_id, model, context_length, catalog_row=None):
     """Ask the configured engine for a read-only memory estimate."""
     if not isinstance(context_length, int) or context_length < 1:
         raise ValueError('A positive planned context length is required')
     device = devices()[device_id]
     if device.get('engine', 'lmstudio') == 'unsloth':
         with client(device_id) as c:
+            if catalog_row is None and ':' in model:
+                catalog_row = find_model(c, model, device_id)
             data = request(c, 'POST', '/api/inference/estimate-memory', {
-                'model_path': model, 'n_ctx': context_length,
+                **unsloth_model_fields(model, catalog_row), 'n_ctx': context_length,
                 'max_seq_length': context_length,
             })
         if data.get('available') is not True:
@@ -462,6 +487,61 @@ def estimate_memory(device_id, model, context_length):
         scale = {'GiB': 2**30, 'MiB': 2**20, 'GB': 10**9, 'MB': 10**6}[match.group(2)]
         values[key] = round(number * scale)
     return dict(values, context_length=context_length, source='lms load --estimate-only')
+
+
+def _deduplicated_gguf_alias_pin_keys(rows):
+    """Return base keys whose memory is represented by one verified loaded pin row."""
+    key_counts = {}
+    for row in rows:
+        key = row.get('key') if isinstance(row, dict) else None
+        if isinstance(key, str) and key:
+            key_counts[key] = key_counts.get(key, 0) + 1
+
+    loaded_pins = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = row.get('key')
+        base_id = row.get('gguf_base_model')
+        quant = row.get('gguf_variant')
+        if (not isinstance(key, str) or key_counts.get(key) != 1 or
+                not isinstance(base_id, str) or not base_id or
+                not isinstance(quant, str) or not quant or key != f'{base_id}:{quant}' or
+                not row.get('loaded_instances')):
+            continue
+        loaded_pins.setdefault(base_id, []).append(row)
+
+    aliases = set()
+    for base_id, pins in loaded_pins.items():
+        base_rows = [row for row in rows if isinstance(row, dict) and row.get('key') == base_id]
+        if len(pins) != 1 or len(base_rows) != 1 or key_counts.get(base_id) != 1:
+            continue
+        base, pin = base_rows[0], pins[0]
+        base_instances = base.get('loaded_instances')
+        pin_instances = pin.get('loaded_instances')
+        if (base.get('gguf_base_model') or base.get('gguf_variant') or
+                base.get('type') != pin.get('type') or
+                not isinstance(base_instances, list) or len(base_instances) != 1 or
+                not isinstance(pin_instances, list) or len(pin_instances) != 1):
+            continue
+        base_instance, pin_instance = base_instances[0], pin_instances[0]
+        if not isinstance(base_instance, dict) or not isinstance(pin_instance, dict):
+            continue
+        base_context = (base_instance.get('config') or {}).get('context_length')
+        pin_context = (pin_instance.get('config') or {}).get('context_length')
+        if (not isinstance(base_context, int) or isinstance(base_context, bool) or base_context < 1 or
+                base_context != pin_context or isinstance(pin_context, bool) or
+                base_instance.get('id') != base_id or pin_instance.get('id') != pin['key']):
+            continue
+        ambiguous_loaded_rows = any(
+            isinstance(row, dict) and row is not base and row is not pin and
+            isinstance(row.get('key'), str) and row['key'].startswith(base_id + ':') and
+            row.get('loaded_instances')
+            for row in rows
+        )
+        if not ambiguous_loaded_rows:
+            aliases.add(base_id)
+    return aliases
 
 
 MEMORY_RESERVE_BYTES = 2**30
@@ -520,16 +600,19 @@ def memory_preflight(device_id, rows, candidate, context_length, max_loaded_byte
     if candidate['loaded_instances']:
         return {'status': 'already_loaded'}
     try:
-        incoming = estimate_memory(device_id, candidate['key'], context_length)
+        incoming = estimate_memory(device_id, candidate['key'], context_length, candidate)
         current = []
+        alias_base_keys = _deduplicated_gguf_alias_pin_keys(rows)
         for row in rows:
+            if row.get('key') in alias_base_keys:
+                continue
             for instance in row['loaded_instances']:
                 config = instance.get('config') or {}
                 actual = config.get('context_length')
                 if not isinstance(actual, int) or actual < 1:
                     raise ValueError('Loaded instance context is unknown')
                 current.append(dict(model=row['key'], instance_id=instance['id'],
-                                    **estimate_memory(device_id, row['key'], actual)))
+                                    **estimate_memory(device_id, row['key'], actual, row)))
         total = incoming['total_bytes'] + sum(item['total_bytes'] for item in current)
         required = round(total * 1.1)
         if max_loaded_bytes is not None and required > max_loaded_bytes:

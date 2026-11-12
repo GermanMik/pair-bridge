@@ -10,6 +10,60 @@ import server
 import management
 
 class ManagementTests(unittest.TestCase):
+    def test_unsloth_inventory_confirms_pin_quant_against_separate_base_row(self):
+        inventory = [
+            {'id': 'publisher/example', 'loaded': False},
+            {'id': 'publisher/example:Q4_K_M', 'loaded': False, 'quant': 'Q4_K_M'},
+            {'id': 'publisher/ordinary:tag', 'loaded': False},
+            {'id': 'publisher/mismatch:Q4_K_M', 'loaded': False, 'quant': 'Q5_K_M'},
+            {'id': 'publisher/orphan:Q4_K_M', 'loaded': False, 'quant': 'Q4_K_M'},
+        ]
+        with patch.object(management, 'devices', return_value={'local': {'engine': 'unsloth'}}), \
+             patch.object(management, 'request', return_value={'data': inventory}):
+            rows = management.models(object(), 'local')
+        pin = next(row for row in rows if row['key'] == 'publisher/example:Q4_K_M')
+        self.assertEqual(pin['key'], 'publisher/example:Q4_K_M')
+        self.assertEqual(pin['gguf_base_model'], 'publisher/example')
+        self.assertEqual(pin['gguf_variant'], 'Q4_K_M')
+        for key in ('publisher/ordinary:tag', 'publisher/mismatch:Q4_K_M', 'publisher/orphan:Q4_K_M'):
+            row = next(row for row in rows if row['key'] == key)
+            self.assertNotIn('gguf_base_model', row)
+            self.assertNotIn('gguf_variant', row)
+            self.assertEqual(management.unsloth_model_fields(key, row), {'model_path': key})
+
+    def test_unsloth_gguf_pin_fields_are_sent_for_load_and_estimate(self):
+        key = 'publisher/example:Q4_K_M'
+        inventory = [
+            {'id': 'publisher/example', 'loaded': False},
+            {'id': key, 'loaded': False, 'quant': 'Q4_K_M'},
+        ]
+        with patch.object(management, 'devices', return_value={'local': {'engine': 'unsloth'}}), \
+             patch.object(management, 'request', return_value={'data': inventory}):
+            catalog_row = management.find_model(object(), key, 'local')
+        expected = {'model_path': 'publisher/example', 'gguf_variant': 'Q4_K_M',
+                    'n_ctx': 40000, 'max_seq_length': 40000}
+        with patch.object(management, 'devices', return_value={'local': {'engine': 'unsloth'}}), \
+             patch.object(management, 'engine_for', return_value='unsloth'), \
+             patch.object(management, 'client', return_value=self.scope()), \
+             patch.object(management, 'request', return_value={'available': True, 'total_bytes': 100, 'gpu_bytes': 90}) as req:
+            management.load_model(object(), 'local', key, 40000, catalog_row=catalog_row)
+            self.assertEqual(req.call_args.args[3], expected)
+            management.estimate_memory('local', key, 40000, catalog_row)
+            self.assertEqual(req.call_args.args[3], expected)
+
+    def test_unsloth_ordinary_colon_tag_payload_is_unchanged(self):
+        key = 'publisher/model:release'
+        catalog_row = {'key': key, 'loaded_instances': []}
+        expected = {'model_path': key, 'n_ctx': 8192, 'max_seq_length': 8192}
+        with patch.object(management, 'devices', return_value={'local': {'engine': 'unsloth'}}), \
+             patch.object(management, 'engine_for', return_value='unsloth'), \
+             patch.object(management, 'client', return_value=self.scope()), \
+             patch.object(management, 'request', return_value={'available': True, 'total_bytes': 100, 'gpu_bytes': 90}) as req:
+            management.load_model(object(), 'local', key, 8192, catalog_row=catalog_row)
+            self.assertEqual(req.call_args.args[3], expected)
+            management.estimate_memory('local', key, 8192, catalog_row)
+            self.assertEqual(req.call_args.args[3], expected)
+
     def scope(self, *_args, **_kwargs):
         return contextlib.nullcontext(object())
 
@@ -174,6 +228,135 @@ class ManagementTests(unittest.TestCase):
             management.ensure_capacity([loaded, candidate], candidate, 100)
         management.ensure_capacity([loaded, candidate], candidate, 120)
 
+    def test_memory_preflight_deduplicates_one_loaded_gguf_base_pin_alias(self):
+        base = {'key': 'p/model', 'type': 'llm',
+                'loaded_instances': [{'id': 'p/model', 'config': {'context_length': 8192}}]}
+        pin = {'key': 'p/model:Q4_K_M', 'type': 'llm', 'gguf_base_model': 'p/model',
+               'gguf_variant': 'Q4_K_M',
+               'loaded_instances': [{'id': 'p/model:Q4_K_M', 'config': {'context_length': 8192}}]}
+        candidate = {'key': 'p/candidate', 'type': 'llm', 'loaded_instances': []}
+        rows = [base, pin, candidate]
+        with patch.object(management, 'estimate_memory', side_effect=lambda device, key, context, row=None: {
+                'total_bytes': {'p/candidate': 50, 'p/model': 50,
+                                'p/model:Q4_K_M': 200}[key], 'gpu_bytes': 0}) as estimate:
+            result = management.memory_preflight('pc', rows, candidate, 8192, 300)
+        self.assertEqual(result['estimated_total_bytes'], 250)
+        self.assertEqual(result['required_with_headroom_bytes'], 275)
+        self.assertEqual(estimate.call_count, 2)
+        self.assertEqual(estimate.call_args_list[0].args[:3], ('pc', 'p/candidate', 8192))
+        self.assertEqual(estimate.call_args_list[1].args[:3], ('pc', 'p/model:Q4_K_M', 8192))
+        self.assertIs(estimate.call_args_list[1].args[3], pin)
+
+    def test_memory_preflight_rejects_variant_weighted_overflow_without_unload(self):
+        base = {'key': 'p/model', 'type': 'llm',
+                'loaded_instances': [{'id': 'p/model', 'config': {'context_length': 8192}}]}
+        pin = {'key': 'p/model:Q4_K_M', 'type': 'llm', 'gguf_base_model': 'p/model',
+               'gguf_variant': 'Q4_K_M',
+               'loaded_instances': [{'id': 'p/model:Q4_K_M', 'config': {'context_length': 8192}}]}
+        candidate = {'key': 'p/candidate', 'type': 'llm', 'loaded_instances': []}
+        rows = [base, pin, candidate]
+        with patch.object(management, 'estimate_memory', side_effect=lambda device, key, context, row=None: {
+                'total_bytes': {'p/candidate': 50, 'p/model': 50,
+                                'p/model:Q4_K_M': 200}[key], 'gpu_bytes': 0}) as estimate, \
+             patch.object(management, 'unload_model') as unload:
+            with self.assertRaisesRegex(ValueError, 'estimated memory limit'):
+                management.memory_preflight('pc', rows, candidate, 8192, 200)
+        self.assertEqual([call.args[1] for call in estimate.call_args_list],
+                         ['p/candidate', 'p/model:Q4_K_M'])
+        unload.assert_not_called()
+
+    def test_preflight_avoids_allowlisted_unload_when_alias_dedupe_fits_cap(self):
+        base = {'key': 'p/model', 'type': 'llm',
+                'loaded_instances': [{'id': 'p/model', 'config': {'context_length': 8192}}]}
+        pin = {'key': 'p/model:Q4_K_M', 'type': 'llm', 'gguf_base_model': 'p/model',
+               'gguf_variant': 'Q4_K_M',
+               'loaded_instances': [{'id': 'p/model:Q4_K_M', 'config': {'context_length': 8192}}]}
+        candidate = {'key': 'p/candidate', 'type': 'llm', 'loaded_instances': []}
+        rows = [base, pin, candidate]
+        with patch.object(management, 'models', return_value=rows), \
+             patch.object(management, 'estimate_memory', side_effect=lambda device, key, context, row=None: {
+                 'total_bytes': {'p/candidate': 50, 'p/model': 50,
+                                 'p/model:Q4_K_M': 200}[key], 'gpu_bytes': 0}), \
+             patch.object(management, 'unload_model') as unload:
+            result = management.preflight_for_load(
+                object(), 'pc', 'p/candidate', 8192, {'auto_unload_models': ['p/model']}, 300)
+        self.assertEqual(result['candidate']['key'], 'p/candidate')
+        self.assertEqual(result['memory']['required_with_headroom_bytes'], 275)
+        self.assertEqual([row['key'] for row in result['rows']],
+                         ['p/model', 'p/model:Q4_K_M', 'p/candidate'])
+        unload.assert_not_called()
+
+    def test_preflight_unloads_exact_base_alias_only_for_real_shortage(self):
+        base = {'key': 'p/model', 'type': 'llm',
+                'loaded_instances': [{'id': 'p/model', 'config': {'context_length': 8192}}]}
+        pin = {'key': 'p/model:Q4_K_M', 'type': 'llm', 'gguf_base_model': 'p/model',
+               'gguf_variant': 'Q4_K_M',
+               'loaded_instances': [{'id': 'p/model:Q4_K_M', 'config': {'context_length': 8192}}]}
+        candidate = {'key': 'p/candidate', 'type': 'llm', 'loaded_instances': []}
+        before = [base, pin, candidate]
+        after = [dict(base, loaded_instances=[]), dict(pin, loaded_instances=[]), candidate]
+        with patch.object(management, 'models', side_effect=[before, before, after]), \
+             patch.object(management, 'estimate_memory', return_value={
+                 'total_bytes': 100, 'gpu_bytes': 0}), \
+             patch.object(management, 'unload_model') as unload:
+            result = management.preflight_for_load(
+                object(), 'pc', 'p/candidate', 8192, {'auto_unload_models': ['p/model']}, 210)
+        unload.assert_called_once_with(unittest.mock.ANY, 'pc', 'p/model', 'p/model')
+        self.assertEqual(result['auto_unloaded_instances'], [
+            {'model': 'p/model', 'instance_id': 'p/model'}])
+        self.assertEqual(result['candidate']['key'], 'p/candidate')
+        self.assertEqual(result['memory']['required_with_headroom_bytes'], 110)
+        self.assertEqual(result['rows'][1]['key'], 'p/model:Q4_K_M')
+        self.assertEqual(result['rows'][1]['loaded_instances'], [])
+
+    def test_preflight_still_rejects_after_confirmed_alias_unload_when_candidate_exceeds_cap(self):
+        base = {'key': 'p/model', 'type': 'llm',
+                'loaded_instances': [{'id': 'p/model', 'config': {'context_length': 8192}}]}
+        pin = {'key': 'p/model:Q4_K_M', 'type': 'llm', 'gguf_base_model': 'p/model',
+               'gguf_variant': 'Q4_K_M',
+               'loaded_instances': [{'id': 'p/model:Q4_K_M', 'config': {'context_length': 8192}}]}
+        candidate = {'key': 'p/candidate', 'type': 'llm', 'loaded_instances': []}
+        before = [base, pin, candidate]
+        after = [dict(base, loaded_instances=[]), dict(pin, loaded_instances=[]), candidate]
+        with patch.object(management, 'models', side_effect=[before, before, after, after]), \
+             patch.object(management, 'estimate_memory', return_value={
+                 'total_bytes': 100, 'gpu_bytes': 0}), \
+             patch.object(management, 'unload_model') as unload:
+            with self.assertRaisesRegex(ValueError, 'did not free enough memory') as failure:
+                management.preflight_for_load(
+                    object(), 'pc', 'p/candidate', 8192, {'auto_unload_models': ['p/model']}, 100)
+        unload.assert_called_once_with(unittest.mock.ANY, 'pc', 'p/model', 'p/model')
+        self.assertEqual(failure.exception.auto_unloaded_instances, [
+            {'model': 'p/model', 'instance_id': 'p/model'}])
+
+    def test_memory_preflight_keeps_multiple_variants_and_slots_distinct(self):
+        base = {'key': 'p/model', 'type': 'llm',
+                'loaded_instances': [{'id': 'p/model', 'config': {'context_length': 8192}}]}
+        pin_q4 = {'key': 'p/model:Q4_K_M', 'type': 'llm', 'gguf_base_model': 'p/model',
+                  'gguf_variant': 'Q4_K_M',
+                  'loaded_instances': [{'id': 'p/model:Q4_K_M', 'config': {'context_length': 8192}}]}
+        pin_q5 = {'key': 'p/model:Q5_K_M', 'type': 'llm', 'gguf_base_model': 'p/model',
+                  'gguf_variant': 'Q5_K_M',
+                  'loaded_instances': [{'id': 'p/model:Q5_K_M', 'config': {'context_length': 8192}}]}
+        candidate = {'key': 'p/candidate', 'type': 'llm', 'loaded_instances': []}
+        variants = [base, pin_q4, pin_q5, candidate]
+        with patch.object(management, 'estimate_memory', return_value={
+                'total_bytes': 100, 'gpu_bytes': 0}) as estimate:
+            result = management.memory_preflight('pc', variants, candidate, 8192, 1000)
+        self.assertEqual(result['estimated_total_bytes'], 400)
+        self.assertEqual(estimate.call_count, 4)
+
+        two_slots = dict(base, loaded_instances=[
+            {'id': 'p/model-slot-1', 'config': {'context_length': 8192}},
+            {'id': 'p/model-slot-2', 'config': {'context_length': 8192}},
+        ])
+        rows = [two_slots, pin_q4, candidate]
+        with patch.object(management, 'estimate_memory', return_value={
+                'total_bytes': 100, 'gpu_bytes': 0}) as estimate:
+            result = management.memory_preflight('pc', rows, candidate, 8192, 1000)
+        self.assertEqual(result['estimated_total_bytes'], 400)
+        self.assertEqual(estimate.call_count, 4)
+
     def test_memory_preflight_uses_loaded_context_and_blocks_cap(self):
         loaded = {'key': 'running', 'loaded_instances': [{'id': 'i', 'config': {'context_length': 65536}}]}
         cold = {'key': 'new', 'loaded_instances': []}
@@ -182,7 +365,7 @@ class ManagementTests(unittest.TestCase):
             {'total_bytes': 30, 'gpu_bytes': 30, 'context_length': 65536}]) as estimate:
             result = management.memory_preflight('pc', [loaded, cold], cold, 8192, 60)
         self.assertEqual(result['estimated_total_bytes'], 50)
-        self.assertEqual(estimate.call_args_list[1].args, ('pc', 'running', 65536))
+        self.assertEqual(estimate.call_args_list[1].args, ('pc', 'running', 65536, loaded))
         with patch.object(management, 'estimate_memory', side_effect=[
             {'total_bytes': 20, 'gpu_bytes': 20}, {'total_bytes': 30, 'gpu_bytes': 30}]):
             with self.assertRaisesRegex(ValueError, 'estimated memory limit'):

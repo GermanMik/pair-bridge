@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.5
+
+- Send installed Unsloth GGUF catalog entries as separate repository and variant fields for loading and memory estimates.
+- Document how to verify installed Unsloth models and GGUF variant behavior without machine-specific credentials.
+- Count a confirmed loaded GGUF base/pin alias once using the exact loaded pin estimate while preserving exact model IDs and allowlisted unload checks.
+- Validation: 218 tests passed with the cached Python environment, including the packaged server self-test.
+
 ## 0.8.4
 
 - Preserve per-attempt finish/usage/reasoning-presence evidence, distinguish tool/refusal/transport failures, and expose the running version and source build.

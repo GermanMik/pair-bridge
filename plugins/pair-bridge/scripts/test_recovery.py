@@ -225,7 +225,7 @@ class RecoveryTests(unittest.TestCase):
     def test_runtime_fingerprint_and_prompt_budget_are_honest(self):
         with patch.object(server.management, 'devices', return_value={}):
             row = server.pair_capabilities()
-        self.assertEqual(row['bridge_version'], '0.8.4')
+        self.assertEqual(row['bridge_version'], '0.8.5')
         self.assertEqual(len(row['source_build']), 16)
         self.assertIsNone(row['empty_answer_recovery']['attempt_limit'])
         self.assertIsNone(inference_io.prompt_budget(ITEM, 40000)['request_fits'])
