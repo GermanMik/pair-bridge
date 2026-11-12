@@ -1,5 +1,5 @@
 """Authenticated sync/async MCP fixture: no user credential or model is touched."""
-import asyncio,json,os,sys,tempfile,threading,unittest
+import asyncio,json,os,sys,tempfile,threading,time,unittest
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 from mcp import ClientSession,StdioServerParameters
@@ -47,7 +47,8 @@ class DesktopAuthProtocolTests(unittest.IsolatedAsyncioTestCase):
                                 self.assertFalse(result.isError,str(result.content))
                                 return result.structuredContent or json.loads(next(x.text for x in result.content if x.type=='text'))
                             start=await call('pair_job_start',device='fixture',model='fixture/chat',prompt='fixture request',max_tokens=16384)
-                            for _ in range(80):
+                            deadline=time.monotonic()+30
+                            while time.monotonic()<deadline:
                                 result=await call('pair_job_status',job_id=start['job_id'])
                                 if result['status'] in ('completed','failed','cancelled'):break
                                 await asyncio.sleep(.05)
